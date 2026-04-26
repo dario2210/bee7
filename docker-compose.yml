@@ -1,0 +1,23 @@
+﻿version: "3.8"
+
+services:
+  bee7-bot:
+    build:
+      context: /home/darek/apps/infra/bee7
+      dockerfile: Dockerfile
+    image: bee7-bot:latest
+    container_name: bee7_bot
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8067:8067"
+    volumes:
+      - /home/darek/apps/infra/bee7:/app
+    environment:
+      - TZ=Europe/Warsaw
+      - PYTHONUNBUFFERED=1
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8067')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s

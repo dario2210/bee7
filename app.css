@@ -1,0 +1,204 @@
+﻿:root {
+  --bee-bg: #09111b;
+  --bee-panel: rgba(11, 21, 36, 0.86);
+  --bee-panel-2: rgba(18, 31, 52, 0.9);
+  --bee-border: rgba(131, 153, 179, 0.18);
+  --bee-text: #eef6ff;
+  --bee-muted: #95a6bc;
+  --bee-sky: #69b7ff;
+  --bee-teal: #22d3aa;
+  --bee-amber: #ffb454;
+}
+
+a {
+  color: var(--bee-sky);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+.hero-panel,
+.result-panel {
+  background: var(--bee-panel);
+  border: 1px solid var(--bee-border);
+  border-radius: 24px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(20px);
+}
+
+.hero-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(260px, 0.9fr);
+  gap: 22px;
+  padding: 24px;
+  margin-bottom: 18px;
+}
+
+.hero-copy {
+  display: grid;
+  gap: 10px;
+}
+
+.hero-copy p,
+.hero-note p {
+  color: var(--bee-muted);
+  line-height: 1.55;
+}
+
+.hero-eyebrow,
+.panel-eyebrow {
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--bee-amber);
+}
+
+.hero-note {
+  padding: 18px;
+  border-radius: 20px;
+  background: linear-gradient(180deg, rgba(105, 183, 255, 0.12), rgba(255, 180, 84, 0.08));
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  display: grid;
+  gap: 8px;
+}
+
+.hero-note-title {
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--bee-amber);
+}
+
+.panel-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 18px;
+  align-items: end;
+  margin-bottom: 16px;
+}
+
+.tv-attribution,
+.chart-caption {
+  color: var(--bee-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.result-panel {
+  padding: 22px;
+}
+
+.tv-chart {
+  width: 100%;
+  height: 720px;
+  border-radius: 22px;
+  overflow: hidden;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.02), rgba(5, 10, 17, 0.55));
+}
+
+.chart-caption {
+  margin-top: 12px;
+}
+
+.detail-panel-wrap > div {
+  margin-top: 14px;
+}
+
+.metric-card .label,
+.metric-card .sub {
+  color: var(--bee-muted);
+}
+
+#run-status,
+#run-progress {
+  margin-top: 10px;
+  padding: 12px 14px;
+  border-radius: 16px;
+  border: 1px solid var(--bee-border);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+#run-progress {
+  color: var(--bee-amber) !important;
+}
+
+.wt-drp,
+.wt-drp > div,
+.wt-drp .Select-control,
+.wt-drp .Select-control *,
+.wt-drp [class*="control"],
+.wt-drp [class*="control"] *,
+.wt-drp [class*="singleValue"],
+.wt-drp [class*="singleValue"] *,
+.wt-drp [class*="valueContainer"],
+.wt-drp [class*="valueContainer"] *,
+.wt-drp input,
+.wt-drp .Select-menu-outer,
+.wt-drp .Select-menu {
+  color: #111111 !important;
+  -webkit-text-fill-color: #111111 !important;
+  opacity: 1 !important;
+}
+
+.wt-drp .Select-placeholder,
+.wt-drp .Select--single > .Select-control .Select-value,
+.wt-drp .Select--single > .Select-control .Select-value .Select-value-label,
+.wt-drp .Select.has-value.Select--single > .Select-control .Select-value,
+.wt-drp .Select.has-value.Select--single > .Select-control .Select-value .Select-value-label,
+.wt-drp .Select.has-value.is-pseudo-focused.Select--single > .Select-control .Select-value,
+.wt-drp .Select.has-value.is-pseudo-focused.Select--single > .Select-control .Select-value .Select-value-label,
+.wt-drp .Select-control .Select-value,
+.wt-drp .Select-control .Select-value > *,
+.wt-drp .Select-value-label,
+.wt-drp a.Select-value-label,
+.wt-drp a.Select-value-label:hover,
+.wt-drp a.Select-value-label:visited,
+.wt-drp .Select-input > input,
+.wt-drp .Select-option,
+.wt-drp .VirtualizedSelectOption {
+  color: #111111 !important;
+  opacity: 1 !important;
+}
+
+.wt-drp .VirtualizedSelectFocusedOption,
+.wt-drp .is-focused:not(.is-open) > .Select-control,
+.wt-drp .is-open > .Select-control {
+  color: #111111 !important;
+}
+
+.wt-drp .Select-menu-outer,
+.wt-drp .Select-menu-outer *,
+.wt-drp .Select-menu,
+.wt-drp .Select-menu *,
+.wt-drp .Select-option,
+.wt-drp .VirtualizedSelectOption,
+.wt-drp [class*="menu"],
+.wt-drp [class*="menu"] *,
+.wt-drp [class*="option"] {
+  color: var(--bee-text) !important;
+  -webkit-text-fill-color: var(--bee-text) !important;
+}
+
+@media (max-width: 1180px) {
+  .hero-panel {
+    grid-template-columns: 1fr;
+  }
+
+  .tv-chart {
+    height: 560px;
+  }
+}
+
+@media (max-width: 860px) {
+  .tv-chart {
+    height: 440px;
+  }
+}

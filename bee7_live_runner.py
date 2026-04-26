@@ -1,0 +1,353 @@
+﻿"""
+bee7_live_runner.py
+====================
+Paper/live runner for the first bee7 WaveTrend strategy.
+It uses the exact same engine functions as the backtest.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import numpy as np
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+from bee7_binance import update_csv_cache
+from bee7_data import prepare_indicators
+from bee7_engine import (
+    PositionState,
+    apply_slippage,
+    bar_from_row as _bar_from_row,
+    build_position_state,
+    compute_trade_close,
+    generate_entry_signal,
+    generate_exit_signal,
+)
+from bee7_params import (
+    BINANCE_INTERVAL,
+    BINANCE_MARKET,
+    BINANCE_SYMBOL,
+    FEE_RATE,
+    INITIAL_CAPITAL,
+    load_params,
+)
+
+STATE_FILE = "bee7_live_state.json"
+TRADES_LOG = "bee7_live_trades.jsonl"
+LOG_FILE = "bee7_live_runner.log"
+LOOP_SLEEP_SEC = 60
+
+MAX_DAILY_LOSS_PCT = 3.0
+MAX_POSITIONS = 1
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stdout)],
+)
+log = logging.getLogger("bee7_live")
+
+
+def load_state() -> dict:
+    if not Path(STATE_FILE).exists():
+        return {
+            "position": None,
+            "entry_price": None,
+            "entry_time": None,
+            "bars_in_position": 0,
+            "capital": INITIAL_CAPITAL,
+            "capital_at_open": None,
+            "stop_price": None,
+            "entry_atr": None,
+            "last_bar_time": None,
+            "daily_loss_usd": 0.0,
+            "daily_date": None,
+            "paused": False,
+            "mode": "paper",
+        }
+    with open(STATE_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_state(state: dict) -> None:
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, default=str)
+
+
+def log_trade(trade: dict) -> None:
+    with open(TRADES_LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps(trade, default=str) + "\n")
+
+
+def check_daily_loss(state: dict, capital: float) -> bool:
+    today = datetime.now(timezone.utc).date().isoformat()
+    if state.get("daily_date") != today:
+        state["daily_date"] = today
+        state["daily_loss_usd"] = 0.0
+
+    base_capital = max(capital, 1.0)
+    loss_pct = state["daily_loss_usd"] / base_capital * 100.0
+    if loss_pct >= MAX_DAILY_LOSS_PCT:
+        log.warning(
+            f"[SAFETY] Daily loss limit reached: {loss_pct:.2f}% "
+            f"(limit {MAX_DAILY_LOSS_PCT}%). Runner paused."
+        )
+        return True
+    return False
+
+
+def is_duplicate_bar(state: dict, bar_time: str) -> bool:
+    return state.get("last_bar_time") == bar_time
+
+
+def sync_position_with_exchange(state: dict, mode: str) -> None:
+    if mode != "live":
+        return
+    log.warning(
+        "[LIVE-SAFETY] sync_position_with_exchange() is still a stub. "
+        "Before real deployment, wire in the exchange client."
+    )
+
+
+def position_from_state(state: dict) -> Optional[PositionState]:
+    if not state.get("position"):
+        return None
+    return PositionState(
+        side=state["position"],
+        entry_price=float(state["entry_price"]),
+        entry_time=state["entry_time"],
+        bars_in_position=int(state.get("bars_in_position", 0)),
+        stop_price=float(state["stop_price"]) if state.get("stop_price") is not None else float("nan"),
+        entry_atr=float(state["entry_atr"]) if state.get("entry_atr") is not None else float("nan"),
+    )
+
+
+def position_to_state(state: dict, pos: Optional[PositionState]) -> None:
+    if pos is None:
+        state["position"] = None
+        state["entry_price"] = None
+        state["entry_time"] = None
+        state["bars_in_position"] = 0
+        state["capital_at_open"] = None
+        state["stop_price"] = None
+        state["entry_atr"] = None
+    else:
+        state["position"] = pos.side
+        state["entry_price"] = pos.entry_price
+        state["entry_time"] = str(pos.entry_time)
+        state["bars_in_position"] = pos.bars_in_position
+        state["stop_price"] = None if np.isnan(pos.stop_price) else pos.stop_price
+        state["entry_atr"] = None if np.isnan(pos.entry_atr) else pos.entry_atr
+
+
+def execute_order(
+    side: str,
+    action: str,
+    price: float,
+    capital: float,
+    mode: str,
+    reason: str = "",
+) -> float:
+    if mode == "paper":
+        log.info(
+            f"[PAPER] {action.upper()} {side.upper()} @ {price:.2f} "
+            f"capital={capital:.2f} reason={reason}"
+        )
+        return price
+
+    log.warning("[LIVE] Execution stub active - exchange client is not wired in yet.")
+    raise NotImplementedError(
+        "Live mode requires exchange integration in execute_order()."
+    )
+
+
+def process_bar(bar, prev, params: dict, state: dict, mode: str) -> None:
+    """
+    Process one fully closed candle.
+    The function intentionally uses the same signal generators as the backtest.
+    """
+    bar_time_str = str(bar.time)
+    capital = float(state.get("capital", INITIAL_CAPITAL))
+    fee_rate = float(params.get("fee_rate", FEE_RATE))
+    slip_bps = float(params.get("slippage_bps", 0.0))
+    spread_bps = float(params.get("spread_bps", 0.0))
+
+    if is_duplicate_bar(state, bar_time_str):
+        log.debug(f"[SKIP] Duplicate bar: {bar_time_str}")
+        return
+
+    if check_daily_loss(state, capital):
+        state["paused"] = True
+        save_state(state)
+        return
+
+    if state.get("paused"):
+        log.info("[PAUSED] Runner is paused. Clear the paused flag in state to continue.")
+        return
+
+    position = position_from_state(state)
+
+    if position is not None:
+        sig = generate_exit_signal(bar, prev, params, position)
+        if sig.action != "none":
+            raw_exit = sig.exit_price if sig.exit_price is not None else bar.close
+            exec_price = apply_slippage(raw_exit, position.side, "close", slip_bps, spread_bps)
+            exec_price = execute_order(position.side, "close", exec_price, capital, mode, sig.reason)
+
+            capital_at_open = float(state.get("capital_at_open") or capital)
+            result = compute_trade_close(
+                entry_price=position.entry_price,
+                exit_price=exec_price,
+                side=position.side,
+                fee_rate=fee_rate,
+                capital_at_open=capital_at_open,
+            )
+
+            pnl = result["pnl"]
+            if pnl < 0:
+                state["daily_loss_usd"] = state.get("daily_loss_usd", 0.0) + abs(pnl)
+
+            capital += pnl
+            state["capital"] = capital
+
+            trade_log = {
+                "ts": bar_time_str,
+                "side": position.side,
+                "entry_price": position.entry_price,
+                "exit_price": exec_price,
+                "gross_ret": result["gross_ret"],
+                "net_ret": result["net_ret"],
+                "pnl_usd": pnl,
+                "fee_usd": result["fee_usd"],
+                "reason": sig.reason,
+                "capital": capital,
+                "capital_at_open": capital_at_open,
+                "mode": mode,
+            }
+            log_trade(trade_log)
+            log.info(
+                f"[CLOSE] {position.side.upper()} | entry={position.entry_price:.2f} "
+                f"exit={exec_price:.2f} | net={result['net_ret'] * 100:.3f}% "
+                f"| pnl={pnl:.2f} USD | {sig.reason}"
+            )
+            position_to_state(state, None)
+        else:
+            position_to_state(state, position)
+
+    if state.get("position") is None:
+        sig = generate_entry_signal(bar, prev, params, None)
+        if sig.action in ("open_long", "open_short"):
+            if MAX_POSITIONS <= 0:
+                raise RuntimeError("MAX_POSITIONS must be at least 1")
+
+            side = "long" if sig.action == "open_long" else "short"
+            raw_entry = bar.close
+            exec_price = apply_slippage(raw_entry, side, "open", slip_bps, spread_bps)
+            exec_price = execute_order(side, "open", exec_price, capital, mode, sig.reason)
+
+            entry_meta = dict(sig.meta or {})
+            new_pos = build_position_state(
+                side=side,
+                entry_price=exec_price,
+                entry_time=bar_time_str,
+                bar=bar,
+                params=params,
+                entry_meta=entry_meta,
+            )
+            new_pos.entry_meta["entry_stop_price"] = (
+                round(new_pos.stop_price, 4) if not np.isnan(new_pos.stop_price) else np.nan
+            )
+            position_to_state(state, new_pos)
+            state["capital_at_open"] = capital
+            log.info(
+                f"[OPEN] {side.upper()} @ {exec_price:.2f} | "
+                f"wt1={bar.wt1:.2f} wt2={bar.wt2:.2f} | {sig.reason}"
+            )
+
+    state["last_bar_time"] = bar_time_str
+    save_state(state)
+
+
+def main_loop(mode: str = "paper") -> None:
+    log.info(
+        f"=== bee7 live runner START | mode={mode} | "
+        f"symbol={BINANCE_SYMBOL} interval={BINANCE_INTERVAL} ==="
+    )
+
+    params = load_params()
+    state = load_state()
+    state["mode"] = mode
+    save_state(state)
+
+    sync_position_with_exchange(state, mode)
+
+    csv_path = f"{BINANCE_SYMBOL.lower()}_{BINANCE_INTERVAL}.csv"
+
+    while True:
+        try:
+            df_raw = update_csv_cache(
+                csv_path=csv_path,
+                symbol=BINANCE_SYMBOL,
+                interval=BINANCE_INTERVAL,
+                market=BINANCE_MARKET,
+                verbose=False,
+            )
+            df = prepare_indicators(df_raw)
+            df = df.dropna(subset=["wt1", "wt2"]).reset_index(drop=True)
+
+            if len(df) < 3:
+                log.warning("Not enough rows after indicator preparation.")
+                time.sleep(LOOP_SLEEP_SEC)
+                continue
+
+            # closed candle only:
+            # df.iloc[-1] is still forming
+            # df.iloc[-2] is the latest fully closed candle
+            # df.iloc[-3] is the previous one
+            bar = _bar_from_row(df.iloc[-2], params)
+            prev = _bar_from_row(df.iloc[-3], params)
+
+            log.info(
+                f"Bar: {bar.time} close={bar.close:.2f} "
+                f"wt1={bar.wt1:.2f} wt2={bar.wt2:.2f}"
+            )
+
+            process_bar(bar, prev, params, state, mode)
+
+        except KeyboardInterrupt:
+            log.info("Runner stopped by user.")
+            break
+        except Exception as exc:
+            log.exception(f"Main loop error: {exc!r}")
+
+        time.sleep(LOOP_SLEEP_SEC)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Bee7 WaveTrend live/paper runner")
+    parser.add_argument("--mode", default="paper", choices=["paper", "live"])
+    parser.add_argument("--pause", action="store_true", help="Set paused=true in state and exit")
+    parser.add_argument("--resume", action="store_true", help="Clear paused flag in state and exit")
+    args = parser.parse_args()
+
+    if args.pause:
+        state = load_state()
+        state["paused"] = True
+        save_state(state)
+        print("[PAUSE] Runner paused.")
+        sys.exit(0)
+
+    if args.resume:
+        state = load_state()
+        state["paused"] = False
+        save_state(state)
+        print("[RESUME] Runner resumed.")
+        sys.exit(0)
+
+    main_loop(mode=args.mode)
+
