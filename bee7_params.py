@@ -214,8 +214,8 @@ def load_params() -> dict:
     else:
         print(f"[params] Missing {WFO_BEST_PARAMS_PATH} - using DEFAULT_PARAMS")
 
-    # BEE7 runs mirrored long/short signals with the long grid as the source
-    # of paired inverse short thresholds.
+    # BEE7 keeps long and short enabled; WFO can select independent levels
+    # for each direction.
     params["trade_direction"] = "both"
     params["allow_longs"] = True
     params["allow_shorts"] = True

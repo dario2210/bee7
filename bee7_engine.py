@@ -371,7 +371,7 @@ def generate_entry_signal(
     """
     Entry logic for BEE7:
       - long on a fresh or recent H1 bullish cross in a low H1 zone
-      - short on a fresh or recent H1 bearish cross in the mirrored high H1 zone
+      - short on a fresh or recent H1 bearish cross in its own high H1 zone
       - long uses a softer H4 filter: low/neutral H4 zone + improving H4 delta
     """
     if position is not None:
@@ -594,8 +594,8 @@ def generate_exit_signal(
     Exit logic for BEE7:
       - emergency long stop is disabled by default
       - remaining long closes when H1/H4 close levels are met and H1 momentum weakens
-      - remaining long reverses when a valid mirrored short-entry signal appears
-      - remaining short closes on mirrored low-zone H1/H4 levels or reverses on long entry
+      - remaining long reverses when a valid short-entry signal appears
+      - remaining short closes on its own low-zone H1/H4 levels or reverses on long entry
     """
     position.bars_in_position += 1
 

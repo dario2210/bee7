@@ -416,7 +416,7 @@ class TestEntrySignals:
 
         assert sig.action == "none"
 
-    def test_direct_short_entry_opens_on_mirrored_red_signal(self):
+    def test_direct_short_entry_opens_on_own_red_signal(self):
         prev = _make_bar(
             wt1=48.0,
             wt2=42.0,
@@ -1001,7 +1001,7 @@ class TestExitSignals:
 
         assert sig.action == "none"
 
-    def test_mirrored_low_zone_exit_closes_short_without_long_signal(self):
+    def test_own_low_zone_exit_closes_short_without_long_signal(self):
         prev = _make_bar(
             wt1=-58.0,
             wt2=-52.0,
@@ -1324,12 +1324,12 @@ class TestWFOHelpers:
                 "best_wt_ema_filter_len": [20, 20, 20],
                 "best_wt_long_entry_max_above_zero": [-30.0, -30.0, -40.0],
                 "best_wt_long_close_min_level": [0.0, 10.0, 10.0],
-                "best_wt_short_entry_min_below_zero": [30.0, 30.0, 40.0],
-                "best_wt_short_close_max_level": [0.0, -10.0, -10.0],
+                "best_wt_short_entry_min_below_zero": [50.0, 50.0, 60.0],
+                "best_wt_short_close_max_level": [-60.0, -60.0, -50.0],
                 "best_wt_h4_long_filter_max": [-20.0, -20.0, -30.0],
                 "best_wt_h4_long_close_min": [0.0, 20.0, 20.0],
-                "best_wt_h4_short_filter_min": [20.0, 20.0, 30.0],
-                "best_wt_h4_short_close_max": [0.0, -20.0, -20.0],
+                "best_wt_h4_short_filter_min": [55.0, 55.0, 65.0],
+                "best_wt_h4_short_close_max": [-45.0, -45.0, -55.0],
                 "best_wt_long_emergency_sl_capital_pct": [0.0, 0.05, 0.05],
                 "allow_longs": [True, True, True],
                 "allow_shorts": [False, False, False],
@@ -1349,13 +1349,13 @@ class TestWFOHelpers:
         assert best["wt_long_entry_max_above_zero"] == pytest.approx(-30.0)
         assert best["wt_long_close_min_level"] == pytest.approx(10.0)
         assert best["wt_long_exit_min_level"] == pytest.approx(10.0)
-        assert best["wt_short_entry_min_below_zero"] == pytest.approx(30.0)
-        assert best["wt_short_close_max_level"] == pytest.approx(-10.0)
-        assert best["wt_short_exit_max_level"] == pytest.approx(-10.0)
+        assert best["wt_short_entry_min_below_zero"] == pytest.approx(50.0)
+        assert best["wt_short_close_max_level"] == pytest.approx(-60.0)
+        assert best["wt_short_exit_max_level"] == pytest.approx(-60.0)
         assert best["wt_h4_long_filter_max"] == pytest.approx(-20.0)
         assert best["wt_h4_long_close_min"] == pytest.approx(20.0)
-        assert best["wt_h4_short_filter_min"] == pytest.approx(20.0)
-        assert best["wt_h4_short_close_max"] == pytest.approx(-20.0)
+        assert best["wt_h4_short_filter_min"] == pytest.approx(55.0)
+        assert best["wt_h4_short_close_max"] == pytest.approx(-45.0)
         assert best["wt_long_emergency_sl_enabled"] is True
         assert best["wt_long_emergency_sl_capital_pct"] == pytest.approx(0.05)
 
@@ -1386,8 +1386,12 @@ class TestWFOHelpers:
             "wt_ema_filter_len": [20],
             "wt_long_entry_max_above_zero": [-30.0],
             "wt_long_close_min_level": [0.0],
+            "wt_short_entry_min_below_zero": [50.0],
+            "wt_short_close_max_level": [-60.0],
             "wt_h4_long_filter_max": [-20.0],
             "wt_h4_long_close_min": [0.0],
+            "wt_h4_short_filter_min": [55.0],
+            "wt_h4_short_close_max": [-45.0],
             "wt_long_emergency_sl_capital_pct": [0.05],
         }
 
@@ -1410,12 +1414,12 @@ class TestWFOHelpers:
         assert set(windows_df["best_wt_signal_len"]) == {3}
         assert set(windows_df["best_wt_long_entry_max_above_zero"]) == {-30.0}
         assert set(windows_df["best_wt_long_close_min_level"]) == {0.0}
-        assert set(windows_df["best_wt_short_entry_min_below_zero"]) == {30.0}
-        assert set(windows_df["best_wt_short_close_max_level"]) == {0.0}
+        assert set(windows_df["best_wt_short_entry_min_below_zero"]) == {50.0}
+        assert set(windows_df["best_wt_short_close_max_level"]) == {-60.0}
         assert set(windows_df["best_wt_h4_long_filter_max"]) == {-20.0}
         assert set(windows_df["best_wt_h4_long_close_min"]) == {0.0}
-        assert set(windows_df["best_wt_h4_short_filter_min"]) == {20.0}
-        assert set(windows_df["best_wt_h4_short_close_max"]) == {0.0}
+        assert set(windows_df["best_wt_h4_short_filter_min"]) == {55.0}
+        assert set(windows_df["best_wt_h4_short_close_max"]) == {-45.0}
         assert set(windows_df["best_wt_long_emergency_sl_capital_pct"]) == {0.05}
         assert set(windows_df["best_wt_long_emergency_sl_enabled"]) == {True}
 

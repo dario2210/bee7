@@ -24,10 +24,12 @@ from bee7_params import (
     WT_EMA_FILTER_LEN_OPTIONS,
     WT_LONG_ENTRY_MAX_ABOVE_ZERO_GRID, WT_LONG_ENTRY_MAX_ABOVE_ZERO_OPTIONS,
     WT_LONG_CLOSE_MIN_LEVEL_GRID, WT_LONG_CLOSE_MIN_LEVEL_OPTIONS,
-    WT_SHORT_ENTRY_MIN_BELOW_ZERO_OPTIONS,
+    WT_SHORT_ENTRY_MIN_BELOW_ZERO_GRID, WT_SHORT_ENTRY_MIN_BELOW_ZERO_OPTIONS,
+    WT_SHORT_CLOSE_MAX_LEVEL_GRID, WT_SHORT_CLOSE_MAX_LEVEL_OPTIONS,
     WT_H4_LONG_FILTER_MAX_GRID, WT_H4_LONG_FILTER_MAX_OPTIONS,
     WT_H4_LONG_CLOSE_MIN_GRID, WT_H4_LONG_CLOSE_MIN_OPTIONS,
-    WT_H4_SHORT_FILTER_MIN_OPTIONS,
+    WT_H4_SHORT_FILTER_MIN_GRID, WT_H4_SHORT_FILTER_MIN_OPTIONS,
+    WT_H4_SHORT_CLOSE_MAX_GRID, WT_H4_SHORT_CLOSE_MAX_OPTIONS,
     WT_LONG_EMERGENCY_SL_CAPITAL_PCT_GRID, WT_LONG_EMERGENCY_SL_CAPITAL_PCT_OPTIONS,
 )
 from bee7_data     import (
@@ -272,7 +274,7 @@ def _clean_selected_values(values, fallback, caster):
 
 
 def _direction_flags(direction) -> tuple[str, bool, bool]:
-    # BEE7 mirrors long signals into short signals and keeps both directions on.
+    # BEE7 keeps both directions enabled; long and short use independent levels.
     return "both", True, True
 
 
@@ -295,8 +297,10 @@ def _strategy_params_from_controls(
     ema_filter_len,
     long_zone,
     short_zone,
+    short_close_level,
     h4_long_filter,
     h4_short_filter,
+    h4_short_close_level,
     long_close_level,
     h4_long_close_level,
     long_tp1_pct,
@@ -326,10 +330,22 @@ def _strategy_params_from_controls(
         if h4_long_close_level not in (None, "")
         else DEFAULT_PARAMS["wt_h4_long_close_min"]
     )
-    short_entry_level = abs(long_entry_level)
-    short_close_h1 = -abs(long_close_h1)
-    h4_short_open = abs(h4_long_open)
-    h4_short_close = -abs(h4_long_close)
+    short_entry_level = float(
+        short_zone if short_zone not in (None, "") else DEFAULT_PARAMS["wt_short_entry_min_below_zero"]
+    )
+    short_close_h1 = float(
+        short_close_level
+        if short_close_level not in (None, "")
+        else DEFAULT_PARAMS["wt_short_close_max_level"]
+    )
+    h4_short_open = float(
+        h4_short_filter if h4_short_filter not in (None, "") else DEFAULT_PARAMS["wt_h4_short_filter_min"]
+    )
+    h4_short_close = float(
+        h4_short_close_level
+        if h4_short_close_level not in (None, "")
+        else DEFAULT_PARAMS["wt_h4_short_close_max"]
+    )
     params.update(
         {
             "trade_direction": trade_direction,
@@ -407,8 +423,10 @@ def _grid_overrides_from_controls(
     ema_len_grid,
     long_zone_grid,
     short_zone_grid,
+    short_close_level_grid,
     h4_long_filter_grid,
     h4_short_filter_grid,
+    h4_short_close_grid,
     long_close_level_grid,
     h4_long_close_level_grid,
     long_sl_pct_grid,
@@ -432,6 +450,16 @@ def _grid_overrides_from_controls(
             WT_LONG_CLOSE_MIN_LEVEL_GRID,
             float,
         ),
+        "wt_short_entry_min_below_zero": _clean_selected_values(
+            short_zone_grid,
+            WT_SHORT_ENTRY_MIN_BELOW_ZERO_GRID,
+            float,
+        ),
+        "wt_short_close_max_level": _clean_selected_values(
+            short_close_level_grid,
+            WT_SHORT_CLOSE_MAX_LEVEL_GRID,
+            float,
+        ),
         "wt_h4_long_filter_max": _clean_selected_values(
             h4_long_filter_grid,
             WT_H4_LONG_FILTER_MAX_GRID,
@@ -440,6 +468,16 @@ def _grid_overrides_from_controls(
         "wt_h4_long_close_min": _clean_selected_values(
             h4_long_close_level_grid,
             WT_H4_LONG_CLOSE_MIN_GRID,
+            float,
+        ),
+        "wt_h4_short_filter_min": _clean_selected_values(
+            h4_short_filter_grid,
+            WT_H4_SHORT_FILTER_MIN_GRID,
+            float,
+        ),
+        "wt_h4_short_close_max": _clean_selected_values(
+            h4_short_close_grid,
+            WT_H4_SHORT_CLOSE_MAX_GRID,
             float,
         ),
         "wt_long_emergency_sl_capital_pct": _clean_selected_values(
@@ -451,9 +489,20 @@ def _grid_overrides_from_controls(
 
 
 def _grid_combo_count(grid_overrides: dict) -> int:
+    short_keys = {
+        "wt_short_entry_min_below_zero",
+        "wt_short_close_max_level",
+        "wt_h4_short_filter_min",
+        "wt_h4_short_close_max",
+    }
     total = 1
-    for values in grid_overrides.values():
+    short_profile_count = 1
+    for key, values in grid_overrides.items():
+        if key in short_keys:
+            short_profile_count = max(short_profile_count, len(values or []))
+            continue
         total *= max(1, len(values))
+    total *= short_profile_count
     return total
 
 
@@ -2364,7 +2413,7 @@ def sidebar():
         # nagłówek
         html.Div([
             html.Div("Bee7 Bot",style={"fontSize":"16px","fontWeight":"700","color":C["text"]}),
-            html.Div("WaveTrend mirrored profile",style={"fontSize":"11px","color":C["muted"],"marginTop":"2px"}),
+            html.Div("WaveTrend independent short profile",style={"fontSize":"11px","color":C["muted"],"marginTop":"2px"}),
         ],style={"marginBottom":"20px","paddingBottom":"14px","borderBottom":f"1px solid {C['border']}"}),
 
         # dane
@@ -2402,7 +2451,7 @@ def sidebar():
                 {"label": "WFO", "value": "wfo"},
             ], "wfo")),
             field("Kierunek", drp("inp-direction", [
-                {"label": "Long + mirror short", "value": "both"},
+                {"label": "Long + independent short", "value": "both"},
             ], "both")),
             html.Div([
                 html.Div([field("Fee rate %", inp("inp-fee", round(FEE_RATE*100,4),
@@ -2430,12 +2479,18 @@ def sidebar():
             html.Div([
                 html.Div([field("Long open level H1", inp("inp-bt-long-zone", DEFAULT_PARAMS["wt_long_entry_max_above_zero"], type="number", step=1))], style={"flex":"1"}),
                 html.Div([field("Long close level H1", inp("inp-bt-long-close-level", DEFAULT_PARAMS["wt_long_close_min_level"], type="number", step=1))], style={"flex":"1"}),
-                html.Div([field("Short zone H1", inp("inp-bt-short-zone", DEFAULT_PARAMS["wt_short_entry_min_below_zero"], type="number", step=1))], style={"display":"none"}),
+            ], style={"display":"flex","gap":"8px"}),
+            html.Div([
+                html.Div([field("Short open level H1", inp("inp-bt-short-zone", DEFAULT_PARAMS["wt_short_entry_min_below_zero"], type="number", step=1))], style={"flex":"1"}),
+                html.Div([field("Short close level H1", inp("inp-bt-short-close-level", DEFAULT_PARAMS["wt_short_close_max_level"], type="number", step=1))], style={"flex":"1"}),
             ], style={"display":"flex","gap":"8px"}),
             html.Div([
                 html.Div([field("Long open level H4", inp("inp-bt-h4-long", DEFAULT_PARAMS["wt_h4_long_filter_max"], type="number", step=1))], style={"flex":"1"}),
                 html.Div([field("Long close level H4", inp("inp-bt-h4-long-close", DEFAULT_PARAMS["wt_h4_long_close_min"], type="number", step=1))], style={"flex":"1"}),
-                html.Div([field("Short filter H4", inp("inp-bt-h4-short", DEFAULT_PARAMS["wt_h4_short_filter_min"], type="number", step=1))], style={"display":"none"}),
+            ], style={"display":"flex","gap":"8px"}),
+            html.Div([
+                html.Div([field("Short open level H4", inp("inp-bt-h4-short", DEFAULT_PARAMS["wt_h4_short_filter_min"], type="number", step=1))], style={"flex":"1"}),
+                html.Div([field("Short close level H4", inp("inp-bt-h4-short-close", DEFAULT_PARAMS["wt_h4_short_close_max"], type="number", step=1))], style={"flex":"1"}),
             ], style={"display":"flex","gap":"8px"}),
             html.Div([
                 html.Div([field("TP1 % long", inp("inp-bt-long-tp1-pct", round(DEFAULT_PARAMS["wt_long_tp1_pct"] * 100.0, 2), type="number", min=0, step=0.1))], style={"flex":"1"}),
@@ -2464,7 +2519,7 @@ def sidebar():
                 html.Div([field("EMA length", inp("inp-bt-ema-len", DEFAULT_PARAMS["wt_ema_filter_len"], type="number", min=2, max=200, step=1))], style={"display":"none"}),
             ], style={"display":"flex","gap":"8px"}),
             html.Div(
-                "BEE7: short ma lustrzane wejscie i wyjscie wzgledem longa. Przeciwny sygnal zamyka aktywna pozycje i otwiera druga strone na tym samym barze. TP1/TP2 i break-even po TP1 dzialaja dla long i short.",
+                "BEE7: long i short maja osobne poziomy wejscia oraz wyjscia H1/H4. Przeciwny sygnal zamyka aktywna pozycje i otwiera druga strone na tym samym barze. TP1/TP2 i break-even po TP1 dzialaja dla long i short.",
                 style={"fontSize":"11px","color":C["muted"],"marginTop":"4px"},
             ),
         ],style=card_s),
@@ -2572,14 +2627,18 @@ def sidebar():
                 value=WT_LONG_CLOSE_MIN_LEVEL_GRID, inline=True,
                 inputStyle={"marginRight":"4px","accentColor":C["blue"]},
                 labelStyle={"color":"#e8eaf6","fontSize":"12px","marginRight":"10px"}),
-            html.Div([
-                sec("Short zone min"),
-                dcc.Checklist(id="chk-grid-short-zone",
-                    options=[{"label":f" {v:.1f}","value":v} for v in WT_SHORT_ENTRY_MIN_BELOW_ZERO_OPTIONS],
-                    value=[DEFAULT_PARAMS["wt_short_entry_min_below_zero"]], inline=True,
-                    inputStyle={"marginRight":"4px","accentColor":C["blue"]},
-                    labelStyle={"color":"#e8eaf6","fontSize":"12px","marginRight":"10px"}),
-            ], style={"display":"none"}),
+            sec("Short open level H1"),
+            dcc.Checklist(id="chk-grid-short-zone",
+                options=[{"label":f" {v:.1f}","value":v} for v in WT_SHORT_ENTRY_MIN_BELOW_ZERO_OPTIONS],
+                value=WT_SHORT_ENTRY_MIN_BELOW_ZERO_GRID, inline=True,
+                inputStyle={"marginRight":"4px","accentColor":C["blue"]},
+                labelStyle={"color":"#e8eaf6","fontSize":"12px","marginRight":"10px"}),
+            sec("Short close level H1"),
+            dcc.Checklist(id="chk-grid-short-close-level",
+                options=[{"label":f" {v:.1f}","value":v} for v in WT_SHORT_CLOSE_MAX_LEVEL_OPTIONS],
+                value=WT_SHORT_CLOSE_MAX_LEVEL_GRID, inline=True,
+                inputStyle={"marginRight":"4px","accentColor":C["blue"]},
+                labelStyle={"color":"#e8eaf6","fontSize":"12px","marginRight":"10px"}),
             sec("Long open level H4"),
             dcc.Checklist(id="chk-grid-h4-long",
                 options=[{"label":f" {v:.1f}","value":v} for v in WT_H4_LONG_FILTER_MAX_OPTIONS],
@@ -2592,16 +2651,20 @@ def sidebar():
                 value=WT_H4_LONG_CLOSE_MIN_GRID, inline=True,
                 inputStyle={"marginRight":"4px","accentColor":C["blue"]},
                 labelStyle={"color":"#e8eaf6","fontSize":"12px","marginRight":"10px"}),
-            html.Div([
-                sec("Short filter H4"),
-                dcc.Checklist(id="chk-grid-h4-short",
-                    options=[{"label":f" {v:.1f}","value":v} for v in WT_H4_SHORT_FILTER_MIN_OPTIONS],
-                    value=[DEFAULT_PARAMS["wt_h4_short_filter_min"]], inline=True,
-                    inputStyle={"marginRight":"4px","accentColor":C["blue"]},
-                    labelStyle={"color":"#e8eaf6","fontSize":"12px","marginRight":"10px"}),
-            ], style={"display":"none"}),
+            sec("Short open level H4"),
+            dcc.Checklist(id="chk-grid-h4-short",
+                options=[{"label":f" {v:.1f}","value":v} for v in WT_H4_SHORT_FILTER_MIN_OPTIONS],
+                value=WT_H4_SHORT_FILTER_MIN_GRID, inline=True,
+                inputStyle={"marginRight":"4px","accentColor":C["blue"]},
+                labelStyle={"color":"#e8eaf6","fontSize":"12px","marginRight":"10px"}),
+            sec("Short close level H4"),
+            dcc.Checklist(id="chk-grid-h4-short-close",
+                options=[{"label":f" {v:.1f}","value":v} for v in WT_H4_SHORT_CLOSE_MAX_OPTIONS],
+                value=WT_H4_SHORT_CLOSE_MAX_GRID, inline=True,
+                inputStyle={"marginRight":"4px","accentColor":C["blue"]},
+                labelStyle={"color":"#e8eaf6","fontSize":"12px","marginRight":"10px"}),
             html.Div(
-                "WFO w BEE7 testuje entry window H1, long open level H1/H4, long close level H1/H4 oraz stop loss. Progi short sa liczone jako lustrzane odbicie wybranych progow long.",
+                "WFO w BEE7 testuje long i short osobno. Zeby nie mnozyc siatki do milionow kombinacji, short jest liczony jako kilka niezaleznych profili open/close H1/H4.",
                 style={"fontSize":"11px","color":C["muted"],"marginTop":"8px"},
             ),
         ],id="panel-wfo",style=card_s),
@@ -2879,8 +2942,10 @@ def _worker(
     bt_ema_len,
     bt_long_zone,
     bt_short_zone,
+    bt_short_close_level,
     bt_h4_long,
     bt_h4_short,
+    bt_h4_short_close,
     bt_long_close_level,
     bt_h4_long_close,
     bt_long_tp1_pct,
@@ -2895,8 +2960,10 @@ def _worker(
     grid_ema_len,
     grid_long_zone,
     grid_short_zone,
+    grid_short_close_level,
     grid_h4_long,
     grid_h4_short,
+    grid_h4_short_close,
     grid_long_close_level,
     grid_h4_long_close,
     grid_long_sl_pct,
@@ -2963,8 +3030,10 @@ def _worker(
             bt_ema_len,
             bt_long_zone,
             bt_short_zone,
+            bt_short_close_level,
             bt_h4_long,
             bt_h4_short,
+            bt_h4_short_close,
             bt_long_close_level,
             bt_h4_long_close,
             bt_long_tp1_pct,
@@ -3028,8 +3097,10 @@ def _worker(
             grid_ema_len,
             grid_long_zone,
             grid_short_zone,
+            grid_short_close_level,
             grid_h4_long,
             grid_h4_short,
+            grid_h4_short_close,
             grid_long_close_level,
             grid_h4_long_close,
             grid_long_sl_pct,
@@ -3383,7 +3454,9 @@ def load_saved_result(n_clicks, filename):
     State("inp-bt-htf-filter","value"),
     State("inp-bt-ema-len","value"),
     State("inp-bt-long-zone","value"), State("inp-bt-short-zone","value"),
+    State("inp-bt-short-close-level","value"),
     State("inp-bt-h4-long","value"), State("inp-bt-h4-short","value"),
+    State("inp-bt-h4-short-close","value"),
     State("inp-bt-long-close-level","value"),
     State("inp-bt-h4-long-close","value"),
     State("inp-bt-long-tp1-pct","value"),
@@ -3394,7 +3467,9 @@ def load_saved_result(n_clicks, filename):
     State("chk-grid-htf-filter","value"),
     State("chk-grid-ema-len","value"),
     State("chk-grid-long-zone","value"), State("chk-grid-short-zone","value"),
+    State("chk-grid-short-close-level","value"),
     State("chk-grid-h4-long","value"), State("chk-grid-h4-short","value"),
+    State("chk-grid-h4-short-close","value"),
     State("chk-grid-long-close-level","value"),
     State("chk-grid-h4-long-close","value"),
     State("chk-grid-long-sl-pct","value"),
@@ -3404,11 +3479,13 @@ def on_run_stop(nr, ns,
     sym, tf, mkt, frm, to, cap,
     run_mode, direction, fee, slip, opt, live, score,
     bt_channel, bt_avg, bt_signal, bt_min_level,
-    bt_reentry, bt_ema_filter, bt_htf_filter, bt_ema_len, bt_long_zone, bt_short_zone, bt_h4_long, bt_h4_short,
+    bt_reentry, bt_ema_filter, bt_htf_filter, bt_ema_len,
+    bt_long_zone, bt_short_zone, bt_short_close_level, bt_h4_long, bt_h4_short, bt_h4_short_close,
     bt_long_close_level, bt_h4_long_close, bt_long_tp1_pct, bt_long_sl_pct,
     grid_channel, grid_avg, grid_signal, grid_min_level,
-    grid_reentry, grid_ema_filter, grid_htf_filter, grid_ema_len, grid_long_zone, grid_short_zone,
-    grid_h4_long, grid_h4_short, grid_long_close_level, grid_h4_long_close, grid_long_sl_pct):
+    grid_reentry, grid_ema_filter, grid_htf_filter, grid_ema_len,
+    grid_long_zone, grid_short_zone, grid_short_close_level, grid_h4_long, grid_h4_short, grid_h4_short_close,
+    grid_long_close_level, grid_h4_long_close, grid_long_sl_pct):
 
     _sty_active = {"flex":"1","background":C["red"],"border":"none","borderRadius":"8px",
                    "color":"#fff","padding":"10px","fontSize":"13px","fontWeight":"600",
@@ -3431,11 +3508,13 @@ def on_run_stop(nr, ns,
             direction or DEFAULT_PARAMS.get("trade_direction", "both"),
             fee, slip, opt, live, score,
             bt_channel, bt_avg, bt_signal, bt_min_level,
-            bt_reentry, bt_ema_filter, bt_htf_filter, bt_ema_len, bt_long_zone, bt_short_zone, bt_h4_long, bt_h4_short,
+            bt_reentry, bt_ema_filter, bt_htf_filter, bt_ema_len,
+            bt_long_zone, bt_short_zone, bt_short_close_level, bt_h4_long, bt_h4_short, bt_h4_short_close,
             bt_long_close_level, bt_h4_long_close, bt_long_tp1_pct, bt_long_sl_pct,
             grid_channel, grid_avg, grid_signal, grid_min_level,
-            grid_reentry, grid_ema_filter, grid_htf_filter, grid_ema_len, grid_long_zone, grid_short_zone,
-            grid_h4_long, grid_h4_short, grid_long_close_level, grid_h4_long_close, grid_long_sl_pct,
+            grid_reentry, grid_ema_filter, grid_htf_filter, grid_ema_len,
+            grid_long_zone, grid_short_zone, grid_short_close_level, grid_h4_long, grid_h4_short, grid_h4_short_close,
+            grid_long_close_level, grid_h4_long_close, grid_long_sl_pct,
         ))
         t.start()
         return True, False, _sty_active        # Run zablokuj, Stop aktywuj

@@ -5,10 +5,10 @@ Dashboard, wykres, flow backtest/WFO/live oraz uklad plikow pozostaja spojne z w
 
 ## Co robi projekt
 
-- domyslnie pracuje w trybie `long/short mirror`
+- domyslnie pracuje w trybie `long/short independent`
 - otwiera `long` na zielonej kropce WaveTrend pod zerem oraz w oknie kilku barow po tym sygnale
 - otwiera `short` na czerwonej kropce WaveTrend nad zerem oraz w oknie kilku barow po tym sygnale
-- zamyka `short` na lustrzanym sygnale wyjscia w niskiej strefie H1/H4 albo przelacza na `long`, gdy pojawia sie standardowy sygnal wejscia `long`
+- zamyka `short` na wlasnych progach wyjscia w niskiej strefie H1/H4 albo przelacza na `long`, gdy pojawia sie standardowy sygnal wejscia `long`
 - zamyka `long` i przelacza na `short`, gdy pelny sygnal short pojawia sie przy otwartym longu
 - prowadzi `long` i `short` przez TP1, TP2 oraz break-even po TP1
 - dopuszcza re-entry longa, gdy WaveTrend nadal utrzymuje sie blisko zera po ostatniej zielonej kropce
@@ -29,8 +29,12 @@ W aktualnej wersji WFO testowane sa:
 - `wt_ema_filter_len`
 - `wt_long_entry_max_above_zero`
 - `wt_long_close_min_level`
+- `wt_short_entry_min_below_zero`
+- `wt_short_close_max_level`
 - `wt_h4_long_filter_max`
 - `wt_h4_long_close_min`
+- `wt_h4_short_filter_min`
+- `wt_h4_short_close_max`
 
 Domyslna siatka WFO:
 
@@ -42,7 +46,7 @@ Domyslna siatka WFO:
 - `EMA filter`: `off, on`
 - `EMA length`: domyslnie `10, 20`; w dashboardzie mozna zaznaczyc tez `8, 15`
 - `long zone max`: domyslnie `-10, -20`; w dashboardzie mozna zaznaczyc tez `-30, -40`
-- short nie ma osobnej siatki; jego progi sa lustrzanym odbiciem wybranych progow long
+- short ma osobne profile WFO: open/close H1 oraz open/close H4 sa dobierane niezaleznie od progow long
 
 Dashboard pokazuje dodatkowe wskazniki jakosci strategii:
 
