@@ -5,12 +5,12 @@ Dashboard, wykres, flow backtest/WFO/live oraz uklad plikow pozostaja spojne z w
 
 ## Co robi projekt
 
-- domyslnie pracuje w trybie `long/short` z lustrzana logika po obu stronach rynku
+- domyslnie pracuje w trybie `long/short reverse`
 - otwiera `long` na zielonej kropce WaveTrend pod zerem oraz w oknie kilku barow po tym sygnale
-- otwiera `short` na czerwonej kropce WaveTrend nad zerem oraz w analogicznym oknie kilku barow po tym sygnale
-- dla `long` wymaga odzyskania wybranej EMA, a dla `short` odrzucenia wybranej EMA, zeby odsiac slabsze setupy
-- dopuszcza re-entry, gdy WaveTrend nadal utrzymuje sie blisko zera po ostatniej zielonej lub czerwonej kropce
-- pozycja zamyka sie i odwraca dopiero na przeciwnym sygnale, zgodnie z profilem WaveTrend
+- otwiera `short` dopiero po normalnym zamknieciu longa na sygnale `long close`
+- zamyka `short` wtedy, gdy pojawia sie standardowy sygnal wejscia `long`
+- prowadzi `long` i `short` przez TP1, TP2 oraz break-even po TP1
+- dopuszcza re-entry longa, gdy WaveTrend nadal utrzymuje sie blisko zera po ostatniej zielonej kropce
 - wspiera backtest, walk-forward optimization oraz live/paper runner
 - zachowuje dashboard z wizualizacja ceny, markerow transakcji oraz panelu `WT1/WT2`
 - pozwala uruchomic zwykly backtest z recznie wybranymi parametrami strategii bez WFO
@@ -23,11 +23,13 @@ W aktualnej wersji WFO testowane sa:
 - `wt_avg_len`
 - `wt_signal_len`
 - `wt_min_signal_level`
-- `wt_long_entry_window_bars` / `wt_short_entry_window_bars`
-- `wt_long_require_ema20_reclaim` / `wt_short_require_ema20_reject`
+- `wt_long_entry_window_bars`
+- `wt_long_require_ema20_reclaim`
 - `wt_ema_filter_len`
 - `wt_long_entry_max_above_zero`
-- `wt_short_entry_min_below_zero`
+- `wt_long_close_min_level`
+- `wt_h4_long_filter_max`
+- `wt_h4_long_close_min`
 
 Domyslna siatka WFO:
 
@@ -39,7 +41,7 @@ Domyslna siatka WFO:
 - `EMA filter`: `off, on`
 - `EMA length`: domyslnie `10, 20`; w dashboardzie mozna zaznaczyc tez `8, 15`
 - `long zone max`: domyslnie `-10, -20`; w dashboardzie mozna zaznaczyc tez `-30, -40`
-- `short zone min`: domyslnie `10, 20`; w dashboardzie mozna zaznaczyc tez `30, 40`
+- short nie ma osobnej siatki wejscia; korzysta z punktow przelaczenia longa
 
 Dashboard pokazuje dodatkowe wskazniki jakosci strategii:
 
@@ -66,7 +68,7 @@ Dashboard ma teraz dwa osobne tryby:
 ## Uruchomienie
 
 ```bash
-python bee7_dashboard.py --host 0.0.0.0 --port 8064
+python bee7_dashboard.py --host 0.0.0.0 --port 8067
 ```
 
 ```bash

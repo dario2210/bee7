@@ -154,15 +154,9 @@ def walk_forward_optimization(
         WT_LONG_CLOSE_MIN_LEVEL_GRID,
         float,
     )
-    short_zone_grid = (
-        _clean_grid(
-            grid_overrides.get("wt_short_entry_min_below_zero"),
-            WT_SHORT_ENTRY_MIN_BELOW_ZERO_GRID,
-            float,
-        )
-        if shorts_enabled
-        else [WT_SHORT_ENTRY_MIN_BELOW_ZERO]
-    )
+    # In the BEE7 reverse-short experiment, short entries do not use their own
+    # H1/H4 filters. They are opened only after the normal long close signal.
+    short_zone_grid = [WT_SHORT_ENTRY_MIN_BELOW_ZERO]
     h4_long_filter_grid = _clean_grid(
         grid_overrides.get("wt_h4_long_filter_max"),
         WT_H4_LONG_FILTER_MAX_GRID,
@@ -178,15 +172,7 @@ def walk_forward_optimization(
         WT_LONG_EMERGENCY_SL_CAPITAL_PCT_GRID,
         float,
     )
-    h4_short_filter_grid = (
-        _clean_grid(
-            grid_overrides.get("wt_h4_short_filter_min"),
-            WT_H4_SHORT_FILTER_MIN_GRID,
-            float,
-        )
-        if shorts_enabled
-        else [WT_H4_SHORT_FILTER_MIN]
-    )
+    h4_short_filter_grid = [WT_H4_SHORT_FILTER_MIN]
     n = len(df)
     start = 0
     window_id = 0
@@ -249,8 +235,6 @@ def walk_forward_optimization(
             "wt_h4_long_close_min",
             "wt_long_emergency_sl_capital_pct",
         ]
-        if shorts_enabled:
-            selection_keys.extend(["wt_short_entry_min_below_zero", "wt_h4_short_filter_min"])
         best_score = -1e9
         best_params = None
         best_opt_trades = None
@@ -338,6 +322,15 @@ def walk_forward_optimization(
                         "allow_longs": True,
                         "allow_shorts": False,
                         "short_trading_enabled": False,
+                    }
+                )
+            else:
+                params.update(
+                    {
+                        "trade_direction": "both",
+                        "allow_longs": True,
+                        "allow_shorts": True,
+                        "short_trading_enabled": True,
                     }
                 )
             strat = Bee7Strategy(params, fee_rate=fee_rate)
@@ -497,7 +490,7 @@ def walk_forward_optimization(
                 f"open_h4={best_params.get('wt_h4_long_filter_max', WT_H4_LONG_FILTER_MAX):.1f} "
                 f"close_h4={best_params.get('wt_h4_long_close_min', WT_H4_LONG_CLOSE_MIN):.1f} "
                 f"sl={best_params.get('wt_long_emergency_sl_capital_pct', WT_LONG_EMERGENCY_SL_CAPITAL_PCT) * 100:.0f}% "
-                f"short=off"
+                f"short=reverse"
             )
 
         if on_window_done is not None:
@@ -597,14 +590,14 @@ def get_latest_best_params(windows_df: pd.DataFrame) -> dict:
         else WT_LONG_EMERGENCY_SL_CAPITAL_PCT
     )
     allow_longs = True
-    allow_shorts = False
-    trade_direction = "long"
+    allow_shorts = True
+    trade_direction = "both"
 
     return {
         "trade_direction": trade_direction,
         "allow_longs": allow_longs,
         "allow_shorts": allow_shorts,
-        "short_trading_enabled": False,
+        "short_trading_enabled": True,
         "wt_channel_len": channel_len,
         "wt_avg_len": avg_len,
         "wt_signal_len": signal_len,

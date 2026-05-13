@@ -23,6 +23,7 @@ from bee7_engine import (
     generate_entry_signal,
     generate_exit_signal,
     generate_partial_exit_signal,
+    generate_short_reversal_entry_signal,
 )
 from bee7_params import FEE_RATE
 
@@ -208,6 +209,32 @@ class Bee7Strategy:
             self.position = None
         return rec, new_capital
 
+    def _open_position_from_signal(self, sig: Signal, bar) -> None:
+        side = "long" if sig.action == "open_long" else "short"
+        entry_price = apply_slippage(
+            bar.close,
+            side,
+            "open",
+            self.slippage_bps,
+            self.spread_bps,
+        )
+        entry_meta = dict(sig.meta or {})
+        self.position = build_position_state(
+            side=side,
+            entry_price=entry_price,
+            entry_time=bar.time,
+            bar=bar,
+            params=self.params,
+            entry_meta=entry_meta,
+        )
+        self.position.trade_id = self.next_trade_id
+        self.next_trade_id += 1
+        self.position.entry_meta["entry_stop_price"] = (
+            round(self.position.stop_price, 4)
+            if not np.isnan(self.position.stop_price)
+            else np.nan
+        )
+
     def run(self, df, initial_capital):
         capital = initial_capital
         capital_at_open = initial_capital
@@ -224,6 +251,7 @@ class Bee7Strategy:
         for i in range(1, len(df)):
             bar = bar_from_row(df.iloc[i], self.params)
             prev = bar_from_row(df.iloc[i - 1], self.params)
+            pending_entry_signal = None
 
             if any(np.isnan(v) for v in [bar.wt1, bar.wt2, prev.wt1, prev.wt2]):
                 continue
@@ -250,37 +278,19 @@ class Bee7Strategy:
             if self.position is not None:
                 sig = generate_exit_signal(bar, prev, self.params, self.position)
                 if sig.action != "none":
+                    closing_side = self.position.side
                     rec, capital = self._close_position(capital, bar, sig, capital_at_open)
                     trades.append(rec)
                     equity_curve.append((bar.time, capital))
+                    if closing_side == "long":
+                        reverse_sig = generate_short_reversal_entry_signal(bar, prev, self.params, sig)
+                        if reverse_sig.action == "open_short":
+                            pending_entry_signal = reverse_sig
 
             if self.position is None:
-                sig = generate_entry_signal(bar, prev, self.params, self.position)
+                sig = pending_entry_signal or generate_entry_signal(bar, prev, self.params, self.position)
                 if sig.action in ("open_long", "open_short"):
-                    side = "long" if sig.action == "open_long" else "short"
-                    entry_price = apply_slippage(
-                        bar.close,
-                        side,
-                        "open",
-                        self.slippage_bps,
-                        self.spread_bps,
-                    )
-                    entry_meta = dict(sig.meta or {})
-                    self.position = build_position_state(
-                        side=side,
-                        entry_price=entry_price,
-                        entry_time=bar.time,
-                        bar=bar,
-                        params=self.params,
-                        entry_meta=entry_meta,
-                    )
-                    self.position.trade_id = self.next_trade_id
-                    self.next_trade_id += 1
-                    self.position.entry_meta["entry_stop_price"] = (
-                        round(self.position.stop_price, 4)
-                        if not np.isnan(self.position.stop_price)
-                        else np.nan
-                    )
+                    self._open_position_from_signal(sig, bar)
                     capital_at_open = capital
 
         if self.position is not None:

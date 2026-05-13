@@ -272,8 +272,9 @@ def _clean_selected_values(values, fallback, caster):
 
 
 def _direction_flags(direction) -> tuple[str, bool, bool]:
-    # BEE7 currently tests only the long side. Short signals are ignored by design.
-    return "long", True, False
+    # BEE7 reverse-short experiment: long signals stay primary, while a normal
+    # long exit may open short and the next long signal closes it.
+    return "both", True, True
 
 
 def _pct_value(value, fallback: float = 0.0) -> float:
@@ -315,7 +316,7 @@ def _strategy_params_from_controls(
             "trade_direction": trade_direction,
             "allow_longs": allow_longs,
             "allow_shorts": allow_shorts,
-            "short_trading_enabled": False,
+            "short_trading_enabled": allow_shorts,
             "wt_channel_len": int(channel_len if channel_len not in (None, "") else DEFAULT_PARAMS["wt_channel_len"]),
             "wt_avg_len": int(avg_len if avg_len not in (None, "") else DEFAULT_PARAMS["wt_avg_len"]),
             "wt_signal_len": int(signal_len if signal_len not in (None, "") else DEFAULT_PARAMS["wt_signal_len"]),
@@ -377,6 +378,10 @@ def _strategy_params_from_controls(
                 (long_tp1_pct if long_tp1_pct not in (None, "") else DEFAULT_PARAMS.get("wt_short_tp1_pct", 0.01) * 100.0)
             ) / 100.0,
             "wt_short_tp1_fraction": float(DEFAULT_PARAMS.get("wt_short_tp1_fraction", 1.0 / 3.0)),
+            "wt_short_tp1_breakeven_enabled": True,
+            "wt_short_tp2_enabled": True,
+            "wt_short_tp2_pct": float(DEFAULT_PARAMS.get("wt_short_tp2_pct", DEFAULT_PARAMS.get("wt_long_tp2_pct", 0.02))),
+            "wt_short_tp2_fraction": float(DEFAULT_PARAMS.get("wt_short_tp2_fraction", 1.0 / 3.0)),
             "atr_stop_enabled": False,
             "breakeven_trigger_atr": 0.0,
             "trailing_trigger_atr": 0.0,
@@ -2389,8 +2394,8 @@ def sidebar():
                 {"label": "WFO", "value": "wfo"},
             ], "wfo")),
             field("Kierunek", drp("inp-direction", [
-                {"label": "Tylko long (short OFF)", "value": "long"},
-            ], "long")),
+                {"label": "Long + reverse short", "value": "both"},
+            ], "both")),
             html.Div([
                 html.Div([field("Fee rate %", inp("inp-fee", round(FEE_RATE*100,4),
                                                    type="number",min=0,max=1,step=0.001))],style={"flex":"1"}),
@@ -2451,7 +2456,7 @@ def sidebar():
                 html.Div([field("EMA length", inp("inp-bt-ema-len", DEFAULT_PARAMS["wt_ema_filter_len"], type="number", min=2, max=200, step=1))], style={"display":"none"}),
             ], style={"display":"flex","gap":"8px"}),
             html.Div(
-                "BEE7: short jest wyłączony. Entry window H1 pozwala wejść kilka świec po zielonej kropce. Open level działa jako poziom lub niżej, close level jako poziom lub wyżej. TP1 zamyka 1/3 longa przy +1%, a jeżeli przed TP2 cena wróci do wejścia, reszta wychodzi na break-even. Stop loss może być wyłączony albo ustawiony na 1/2/5/10%.",
+                "BEE7: short otwiera się po normalnym zamknięciu longa i zamyka się na kolejnym sygnale long. TP1/TP2 i break-even po TP1 działają lustrzanie dla long i short. WFO nadal optymalizuje poziomy long open/close H1/H4.",
                 style={"fontSize":"11px","color":C["muted"],"marginTop":"4px"},
             ),
         ],style=card_s),
@@ -2588,7 +2593,7 @@ def sidebar():
                     labelStyle={"color":"#e8eaf6","fontSize":"12px","marginRight":"10px"}),
             ], style={"display":"none"}),
             html.Div(
-                "WFO w BEE7 testuje tylko long: entry window H1, open level H1/H4, close level H1/H4 oraz stop loss. Open level oznacza wartość lub niżej, close level wartość lub wyżej.",
+                "WFO w BEE7 testuje entry window H1, long open level H1/H4, long close level H1/H4 oraz stop loss. Short korzysta z tych samych punktów przełączenia: start po long close i koniec przy long open.",
                 style={"fontSize":"11px","color":C["muted"],"marginTop":"8px"},
             ),
         ],id="panel-wfo",style=card_s),

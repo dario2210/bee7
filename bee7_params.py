@@ -29,10 +29,10 @@ WT_AVG_LEN = 21
 WT_SIGNAL_LEN = 3
 WT_MIN_SIGNAL_LEVEL = 0.0
 WT_ZERO_LINE = 0.0
-TRADE_DIRECTION = "long"
+TRADE_DIRECTION = "both"
 ALLOW_LONGS = True
-ALLOW_SHORTS = False
-SHORT_TRADING_ENABLED = False
+ALLOW_SHORTS = True
+SHORT_TRADING_ENABLED = True
 WT_LONG_ENTRY_WINDOW_BARS = 3
 WT_LONG_ENTRY_MAX_ABOVE_ZERO = -30.0
 WT_LONG_CLOSE_MIN_LEVEL = 40.0
@@ -63,6 +63,10 @@ WT_LONG_EMERGENCY_SL_CAPITAL_PCT = 0.0
 WT_SHORT_TP1_ENABLED = True
 WT_SHORT_TP1_PCT = 0.01
 WT_SHORT_TP1_FRACTION = 1.0 / 3.0
+WT_SHORT_TP1_BREAKEVEN_ENABLED = True
+WT_SHORT_TP2_ENABLED = True
+WT_SHORT_TP2_PCT = 0.02
+WT_SHORT_TP2_FRACTION = 1.0 / 3.0
 ATR_LEN = 14
 ATR_STOP_ENABLED = False
 ATR_STOP_MULTIPLIER = 2.0
@@ -156,6 +160,10 @@ DEFAULT_PARAMS = {
     "wt_short_tp1_enabled": WT_SHORT_TP1_ENABLED,
     "wt_short_tp1_pct": WT_SHORT_TP1_PCT,
     "wt_short_tp1_fraction": WT_SHORT_TP1_FRACTION,
+    "wt_short_tp1_breakeven_enabled": WT_SHORT_TP1_BREAKEVEN_ENABLED,
+    "wt_short_tp2_enabled": WT_SHORT_TP2_ENABLED,
+    "wt_short_tp2_pct": WT_SHORT_TP2_PCT,
+    "wt_short_tp2_fraction": WT_SHORT_TP2_FRACTION,
     "htf_ema_len": HTF_EMA_LEN,
     "htf_ema_interval": HTF_EMA_INTERVAL,
     "atr_len": ATR_LEN,
@@ -198,12 +206,12 @@ def load_params() -> dict:
     else:
         print(f"[params] Missing {WFO_BEST_PARAMS_PATH} - using DEFAULT_PARAMS")
 
-    # BEE7 is temporarily long-only. Keep this enforced even when older WFO
-    # result files still contain allow_shorts=true.
-    params["trade_direction"] = "long"
+    # BEE7 runs the reverse-short experiment: normal long exits can open short,
+    # and normal long entries close short.
+    params["trade_direction"] = "both"
     params["allow_longs"] = True
-    params["allow_shorts"] = False
-    params["short_trading_enabled"] = False
+    params["allow_shorts"] = True
+    params["short_trading_enabled"] = True
     sl_pct = float(params.get("wt_long_emergency_sl_capital_pct", 0.0) or 0.0)
     params["wt_long_emergency_sl_capital_pct"] = sl_pct
     params["wt_long_emergency_sl_enabled"] = bool(

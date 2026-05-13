@@ -34,6 +34,7 @@ from bee7_engine import (
     generate_entry_signal,
     generate_exit_signal,
     generate_partial_exit_signal,
+    generate_short_reversal_entry_signal,
 )
 from bee7_strategy import Bee7Strategy
 from bee7_wfo import get_latest_best_params, walk_forward_optimization
@@ -45,10 +46,10 @@ BASE_PARAMS = {
     "wt_signal_len": 3,
     "wt_min_signal_level": 0.0,
     "wt_zero_line": 0.0,
-    "trade_direction": "long",
+    "trade_direction": "both",
     "allow_longs": True,
-    "allow_shorts": False,
-    "short_trading_enabled": False,
+    "allow_shorts": True,
+    "short_trading_enabled": True,
     "wt_long_entry_window_bars": 3,
     "wt_long_entry_max_above_zero": -30.0,
     "wt_long_close_min_level": 40.0,
@@ -77,6 +78,10 @@ BASE_PARAMS = {
     "wt_short_tp1_enabled": True,
     "wt_short_tp1_pct": 0.01,
     "wt_short_tp1_fraction": 1.0 / 3.0,
+    "wt_short_tp1_breakeven_enabled": True,
+    "wt_short_tp2_enabled": True,
+    "wt_short_tp2_pct": 0.02,
+    "wt_short_tp2_fraction": 1.0 / 3.0,
     "atr_stop_enabled": False,
     "atr_stop_multiplier": 2.0,
     "breakeven_trigger_atr": 0.0,
@@ -95,6 +100,7 @@ LONG_ONLY_PARAMS = {
     "trade_direction": "long",
     "allow_longs": True,
     "allow_shorts": False,
+    "short_trading_enabled": False,
 }
 
 SHORT_ONLY_PARAMS = {
@@ -204,6 +210,66 @@ def _signal_df() -> pd.DataFrame:
     df["wt_red_dot"] = (df["wt1"].shift(1) >= df["wt2"].shift(1)) & (df["wt1"] < df["wt2"])
     df["bars_since_wt_green_dot"] = [np.nan, 0.0, 1.0, 2.0]
     df["bars_since_wt_red_dot"] = [np.nan, np.nan, np.nan, 0.0]
+    return df
+
+
+def _short_cycle_df() -> pd.DataFrame:
+    wt1_col, wt2_col = wt_columns(
+        BASE_PARAMS["wt_channel_len"],
+        BASE_PARAMS["wt_avg_len"],
+        BASE_PARAMS["wt_signal_len"],
+    )
+    h4_wt1_col = htf_wt1_column(
+        BASE_PARAMS["wt_channel_len"],
+        BASE_PARAMS["wt_avg_len"],
+        BASE_PARAMS["wt_h4_filter_interval"],
+    )
+    h4_wt2_col = htf_wt2_column(
+        BASE_PARAMS["wt_channel_len"],
+        BASE_PARAMS["wt_avg_len"],
+        BASE_PARAMS["wt_signal_len"],
+        BASE_PARAMS["wt_h4_filter_interval"],
+    )
+    times = pd.date_range("2024-01-01", periods=6, freq="1h", tz="UTC")
+    closes = [1800.0, 1810.0, 1800.0, 1780.0, 1765.0, 1770.0]
+    highs = [1804.0, 1812.0, 1806.0, 1786.0, 1770.0, 1774.0]
+    lows = [1796.0, 1804.0, 1794.0, 1778.0, 1762.0, 1764.0]
+    wt1_vals = [-48.0, -34.0, 50.0, 45.0, -48.0, -34.0]
+    wt2_vals = [-42.0, -44.0, 56.0, 55.0, -44.0, -44.0]
+    h4_wt1_vals = [-34.0, -28.0, 58.0, 60.0, -34.0, -28.0]
+    h4_wt2_vals = [-22.0, -22.0, 52.0, 52.0, -22.0, -22.0]
+
+    df = pd.DataFrame(
+        {
+            "time": times,
+            "open": closes,
+            "high": highs,
+            "low": lows,
+            "close": closes,
+            "volume": [1000.0] * len(closes),
+            wt1_col: wt1_vals,
+            wt2_col: wt2_vals,
+            h4_wt1_col: h4_wt1_vals,
+            h4_wt2_col: h4_wt2_vals,
+            "wt1": wt1_vals,
+            "wt2": wt2_vals,
+            "wt_delta": np.array(wt1_vals) - np.array(wt2_vals),
+            "h4_wt1": h4_wt1_vals,
+            "h4_wt2": h4_wt2_vals,
+        }
+    )
+    df["h4_wt_delta"] = df["h4_wt1"] - df["h4_wt2"]
+    df["h4_prev_wt1"] = df["h4_wt1"].shift(1)
+    df["h4_prev_wt2"] = df["h4_wt2"].shift(1)
+    df["h4_prev_wt_delta"] = df["h4_wt_delta"].shift(1)
+    df["ema20"] = pd.Series(closes).ewm(span=20, adjust=False).mean()
+    df["ema_20"] = df["ema20"]
+    df["htf_ema200"] = pd.Series(closes).ewm(span=200, adjust=False).mean()
+    df["atr"] = [20.0] * len(df)
+    df["wt_green_dot"] = (df["wt1"].shift(1) <= df["wt2"].shift(1)) & (df["wt1"] > df["wt2"])
+    df["wt_red_dot"] = (df["wt1"].shift(1) >= df["wt2"].shift(1)) & (df["wt1"] < df["wt2"])
+    df["bars_since_wt_green_dot"] = [np.nan, 0.0, 1.0, 2.0, np.nan, 0.0]
+    df["bars_since_wt_red_dot"] = [np.nan, np.nan, 0.0, 1.0, 2.0, np.nan]
     return df
 
 
@@ -348,7 +414,7 @@ class TestEntrySignals:
 
         assert sig.action == "none"
 
-    def test_short_entry_is_disabled_by_default(self):
+    def test_direct_short_entry_is_disabled_even_when_shorts_are_enabled(self):
         prev = _make_bar(
             wt1=48.0,
             wt2=42.0,
@@ -370,7 +436,7 @@ class TestEntrySignals:
 
         assert sig.action == "none"
 
-    def test_open_short_on_h1_red_dot_with_h4_filter_when_explicitly_enabled(self):
+    def test_short_reversal_opens_after_normal_long_exit(self):
         prev = _make_bar(
             wt1=48.0,
             wt2=42.0,
@@ -388,10 +454,16 @@ class TestEntrySignals:
             h4_prev_wt2=52.0,
         )
 
-        sig = generate_entry_signal(bar, prev, SHORTS_ENABLED_PARAMS, None)
+        long_exit = generate_exit_signal(
+            bar,
+            prev,
+            SHORTS_ENABLED_PARAMS,
+            PositionState(side="long", entry_price=1800.0, entry_time=bar.time),
+        )
+        sig = generate_short_reversal_entry_signal(bar, prev, SHORTS_ENABLED_PARAMS, long_exit)
 
         assert sig.action == "open_short"
-        assert sig.reason == "WT_H1_RED_DOT_H4_FILTER"
+        assert sig.reason == "LONG_EXIT_REVERSE_SHORT"
 
     def test_direction_filter_blocks_short_in_long_only_mode(self):
         prev = _make_bar(
@@ -411,7 +483,13 @@ class TestEntrySignals:
             h4_prev_wt2=52.0,
         )
 
-        sig = generate_entry_signal(bar, prev, LONG_ONLY_PARAMS, None)
+        long_exit = generate_exit_signal(
+            bar,
+            prev,
+            LONG_ONLY_PARAMS,
+            PositionState(side="long", entry_price=1800.0, entry_time=bar.time),
+        )
+        sig = generate_short_reversal_entry_signal(bar, prev, LONG_ONLY_PARAMS, long_exit)
 
         assert sig.action == "none"
 
@@ -610,6 +688,45 @@ class TestExitSignals:
         assert sig.reason == "SHORT_TP1_PARTIAL"
         assert sig.exit_price == pytest.approx(1782.0)
         assert sig.meta["close_fraction"] == pytest.approx(1.0 / 3.0)
+
+    def test_short_tp2_closes_one_third_after_tp1_when_price_drops_two_percent(self):
+        bar = _make_bar(close=1800.0)
+        bar.low = 1760.0
+        pos = PositionState(
+            side="short",
+            entry_price=1800.0,
+            entry_time=bar.time,
+            remaining_fraction=2.0 / 3.0,
+            tp1_taken=True,
+        )
+
+        sig = generate_partial_exit_signal(bar, BASE_PARAMS, pos)
+
+        assert sig.action == "close_partial"
+        assert sig.reason == "SHORT_TP2_PARTIAL"
+        assert sig.exit_price == pytest.approx(1764.0)
+        assert sig.meta["close_fraction"] == pytest.approx(1.0 / 3.0)
+
+    def test_short_tp1_breakeven_closes_remaining_before_tp2(self):
+        prev = _make_bar(wt1=45.0, wt2=55.0)
+        bar = _make_bar(wt1=46.0, wt2=54.0)
+        bar.high = 1802.0
+        pos = PositionState(
+            side="short",
+            entry_price=1800.0,
+            entry_time=bar.time,
+            bars_in_position=1,
+            remaining_fraction=2.0 / 3.0,
+            tp1_taken=True,
+            tp1_protection_after_bars=1,
+        )
+
+        sig = generate_exit_signal(bar, prev, BASE_PARAMS, pos)
+
+        assert sig.action == "close_force"
+        assert sig.reason == "SHORT_TP1_BREAKEVEN_EXIT"
+        assert sig.exit_price == pytest.approx(1800.0)
+        assert sig.meta["remaining_fraction_before"] == pytest.approx(2.0 / 3.0)
 
     def test_h1_red_dot_can_close_long_without_opening_short(self):
         prev = _make_bar(
@@ -853,7 +970,7 @@ class TestExitSignals:
 
         assert sig.action == "none"
 
-    def test_h4_green_dot_closes_short(self):
+    def test_h4_green_dot_alone_does_not_close_short(self):
         prev = _make_bar(
             wt1=5.0,
             wt2=8.0,
@@ -874,33 +991,32 @@ class TestExitSignals:
 
         sig = generate_exit_signal(bar, prev, BASE_PARAMS, pos)
 
-        assert sig.action == "close_force"
-        assert sig.reason == "WT_H4_GREEN_DOT_EXIT_SHORT"
+        assert sig.action == "none"
 
-    def test_third_h1_green_dot_closes_short_when_h4_lines_converge(self):
+    def test_long_entry_signal_closes_short(self):
         prev = _make_bar(
-            wt1=-56.0,
-            wt2=-52.0,
-            h4_wt1=-58.0,
-            h4_wt2=-50.0,
-            h4_prev_wt1=-64.0,
-            h4_prev_wt2=-50.0,
+            wt1=-48.0,
+            wt2=-42.0,
+            h4_wt1=-34.0,
+            h4_wt2=-22.0,
+            h4_prev_wt1=-40.0,
+            h4_prev_wt2=-24.0,
         )
         bar = _make_bar(
-            wt1=-46.0,
-            wt2=-50.0,
-            h4_wt1=-56.0,
-            h4_wt2=-50.0,
-            h4_prev_wt1=-64.0,
-            h4_prev_wt2=-50.0,
+            wt1=-34.0,
+            wt2=-44.0,
+            h4_wt1=-28.0,
+            h4_wt2=-22.0,
+            h4_prev_wt1=-34.0,
+            h4_prev_wt2=-22.0,
         )
-        pos = PositionState(side="short", entry_price=1800.0, entry_time=bar.time, h1_green_close_count=2)
+        pos = PositionState(side="short", entry_price=1800.0, entry_time=bar.time)
 
         sig = generate_exit_signal(bar, prev, BASE_PARAMS, pos)
 
         assert sig.action == "close_force"
-        assert sig.reason == "WT_H1_THIRD_GREEN_DOT_H4_CONVERGENCE_EXIT_SHORT"
-        assert sig.meta["h1_green_close_count"] == 3
+        assert sig.reason == "WT_LONG_SIGNAL_EXIT_SHORT"
+        assert sig.meta["long_entry_reason"] == "WT_H1_GREEN_WINDOW_H4_SOFT_FILTER"
 
 
 class TestBarHelpers:
@@ -1060,6 +1176,26 @@ class TestBacktestAccounting:
         assert len(trades) == 1
         assert final_cap < 9_000.0
 
+    def test_long_exit_reverses_to_short_until_next_long_signal(self):
+        df = _short_cycle_df()
+        params = dict(SHORTS_ENABLED_PARAMS, fee_rate=0.0, slippage_bps=0.0, spread_bps=0.0)
+        strat = Bee7Strategy(params, fee_rate=0.0)
+
+        trades, _equity, final_cap = strat.run(df, 9_000.0)
+
+        assert list(trades["side"]) == ["long", "short", "short", "short"]
+        assert list(trades["reason"]) == [
+            "WT_HIGH_ZONE_H1_MOMENTUM_EXIT_LONG",
+            "SHORT_TP1_PARTIAL",
+            "SHORT_TP2_PARTIAL",
+            "WT_LONG_SIGNAL_EXIT_SHORT",
+        ]
+        assert list(trades["trade_event"]) == ["EXIT", "TP1", "TP2", "EXIT"]
+        assert trades.iloc[1]["logical_trade_no"] == trades.iloc[2]["logical_trade_no"]
+        assert trades.iloc[2]["logical_trade_no"] == trades.iloc[3]["logical_trade_no"]
+        assert list(trades["close_fraction"]) == pytest.approx([1.0, 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0])
+        assert final_cap > 9_000.0
+
     def test_open_position_at_data_end_is_not_force_closed(self):
         df = _signal_df()
         params = dict(
@@ -1167,10 +1303,10 @@ class TestWFOHelpers:
 
         best = get_latest_best_params(windows_df)
 
-        assert best["trade_direction"] == "long"
+        assert best["trade_direction"] == "both"
         assert best["allow_longs"] is True
-        assert best["allow_shorts"] is False
-        assert best["short_trading_enabled"] is False
+        assert best["allow_shorts"] is True
+        assert best["short_trading_enabled"] is True
         assert best["wt_channel_len"] == 10
         assert best["wt_avg_len"] == 21
         assert best["wt_signal_len"] == 3

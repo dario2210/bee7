@@ -29,6 +29,7 @@ from bee7_engine import (
     generate_entry_signal,
     generate_exit_signal,
     generate_partial_exit_signal,
+    generate_short_reversal_entry_signal,
 )
 from bee7_params import (
     BINANCE_INTERVAL,
@@ -235,6 +236,7 @@ def process_bar(bar, prev, params: dict, state: dict, mode: str) -> None:
         return
 
     position = position_from_state(state)
+    pending_entry_signal = None
 
     def _close_position_signal(position: PositionState, sig, capital: float, final_close: bool) -> float:
         raw_exit = sig.exit_price if sig.exit_price is not None else bar.close
@@ -330,12 +332,17 @@ def process_bar(bar, prev, params: dict, state: dict, mode: str) -> None:
     if position is not None:
         sig = generate_exit_signal(bar, prev, params, position)
         if sig.action != "none":
+            closing_side = position.side
             capital = _close_position_signal(position, sig, capital, final_close=True)
+            if closing_side == "long":
+                reverse_sig = generate_short_reversal_entry_signal(bar, prev, params, sig)
+                if reverse_sig.action == "open_short":
+                    pending_entry_signal = reverse_sig
         else:
             position_to_state(state, position)
 
     if state.get("position") is None:
-        sig = generate_entry_signal(bar, prev, params, None)
+        sig = pending_entry_signal or generate_entry_signal(bar, prev, params, None)
         if sig.action in ("open_long", "open_short"):
             if MAX_POSITIONS <= 0:
                 raise RuntimeError("MAX_POSITIONS must be at least 1")
