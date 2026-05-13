@@ -293,6 +293,28 @@ def _long_close_level_ok(bar: BarData, params: dict) -> bool:
     )
 
 
+def _short_close_level_ok(bar: BarData, params: dict) -> bool:
+    h1_max = float(
+        params.get(
+            "wt_short_close_max_level",
+            params.get("wt_short_exit_max_level", -float(params.get("wt_long_close_min_level", 0.0))),
+        )
+    )
+    h4_max = float(
+        params.get("wt_h4_short_close_max", -float(params.get("wt_h4_long_close_min", 0.0)))
+    )
+    return (
+        not np.isnan(bar.wt1)
+        and not np.isnan(bar.wt2)
+        and not np.isnan(bar.h4_wt1)
+        and not np.isnan(bar.h4_wt2)
+        and bar.wt1 <= h1_max
+        and bar.wt2 <= h1_max
+        and bar.h4_wt1 <= h4_max
+        and bar.h4_wt2 <= h4_max
+    )
+
+
 def _long_entry_window_ok(bar: BarData, prev_bar: BarData, params: dict) -> bool:
     window_bars = int(params.get("wt_long_entry_window_bars", 0) or 0)
     if _cross_up(bar, prev_bar):
@@ -300,10 +322,23 @@ def _long_entry_window_ok(bar: BarData, prev_bar: BarData, params: dict) -> bool
     return window_bars > 0 and _has_recent_signal(bar.bars_since_wt_green_dot, window_bars)
 
 
+def _short_entry_window_ok(bar: BarData, prev_bar: BarData, params: dict) -> bool:
+    window_bars = int(params.get("wt_short_entry_window_bars", params.get("wt_long_entry_window_bars", 0)) or 0)
+    if _cross_down(bar, prev_bar):
+        return True
+    return window_bars > 0 and _has_recent_signal(bar.bars_since_wt_red_dot, window_bars)
+
+
 def _long_exit_momentum_weakening(bar: BarData, prev_bar: BarData) -> bool:
     if any(np.isnan(v) for v in [bar.wt1, bar.wt_delta, prev_bar.wt1, prev_bar.wt_delta]):
         return False
     return _cross_down(bar, prev_bar) or bar.wt1 < prev_bar.wt1 or bar.wt_delta < prev_bar.wt_delta
+
+
+def _short_exit_momentum_strengthening(bar: BarData, prev_bar: BarData) -> bool:
+    if any(np.isnan(v) for v in [bar.wt1, bar.wt_delta, prev_bar.wt1, prev_bar.wt_delta]):
+        return False
+    return _cross_up(bar, prev_bar) or bar.wt1 > prev_bar.wt1 or bar.wt_delta > prev_bar.wt_delta
 
 
 def _entry_meta(bar: BarData, prev_bar: BarData, params: dict) -> dict:
@@ -336,8 +371,8 @@ def generate_entry_signal(
     """
     Entry logic for BEE7:
       - long on a fresh or recent H1 bullish cross in a low H1 zone
+      - short on a fresh or recent H1 bearish cross in the mirrored high H1 zone
       - long uses a softer H4 filter: low/neutral H4 zone + improving H4 delta
-      - shorts are opened only by generate_short_reversal_entry_signal()
     """
     if position is not None:
         return Signal(action="none")
@@ -348,9 +383,13 @@ def generate_entry_signal(
     min_level = float(params.get("wt_min_signal_level", 0.0))
     level_now = _signal_level(bar)
 
-    allow_longs, _allow_shorts = _direction_flags(params)
+    allow_longs, allow_shorts = _direction_flags(params)
     long_entry_max_above_zero = float(params.get("wt_long_entry_max_above_zero", 0.0))
+    short_entry_min_below_zero = float(
+        params.get("wt_short_entry_min_below_zero", abs(long_entry_max_above_zero))
+    )
     long_h4_ok = _h4_filter_ok(bar, "long", params)
+    short_h4_ok = _h4_filter_ok(bar, "short", params)
 
     fresh_long_cross = (
         allow_longs
@@ -360,7 +399,16 @@ def generate_entry_signal(
         and level_now >= min_level
         and long_h4_ok
     )
+    fresh_short_cross = (
+        allow_shorts
+        and _short_entry_window_ok(bar, prev_bar, params)
+        and bar.wt1 >= short_entry_min_below_zero
+        and bar.wt2 >= short_entry_min_below_zero
+        and level_now >= min_level
+        and short_h4_ok
+    )
     long_cond = fresh_long_cross
+    short_cond = fresh_short_cross
 
     meta = _entry_meta(bar, prev_bar, params)
 
@@ -376,6 +424,18 @@ def generate_entry_signal(
                 else np.nan,
             },
         )
+    if short_cond:
+        return Signal(
+            action="open_short",
+            reason="WT_H1_RED_WINDOW_H4_SOFT_FILTER",
+            meta={
+                **meta,
+                "cross_type": "bearish",
+                "bars_since_red_dot": round(bar.bars_since_wt_red_dot, 4)
+                if not np.isnan(bar.bars_since_wt_red_dot)
+                else np.nan,
+            },
+        )
     return Signal(action="none")
 
 
@@ -385,27 +445,18 @@ def generate_short_reversal_entry_signal(
     params: dict,
     long_exit_signal: Signal,
 ) -> Signal:
-    """Open short only after the normal long close signal fires."""
-    _allow_longs, allow_shorts = _direction_flags(params)
-    if (
-        not allow_shorts
-        or long_exit_signal.action != "close_force"
-        or long_exit_signal.reason != "WT_HIGH_ZONE_H1_MOMENTUM_EXIT_LONG"
-    ):
+    """Open short after a long has been closed and a valid short signal is present."""
+    if long_exit_signal.action != "close_force":
         return Signal(action="none")
 
-    if any(np.isnan(v) for v in [bar.wt1, bar.wt2, prev_bar.wt1, prev_bar.wt2]):
+    short_entry = generate_entry_signal(bar, prev_bar, params, None)
+    if short_entry.action != "open_short":
         return Signal(action="none")
-
-    return Signal(
-        action="open_short",
-        reason="LONG_EXIT_REVERSE_SHORT",
-        meta={
-            **_entry_meta(bar, prev_bar, params),
-            "cross_type": "bearish_reversal",
-            "source_exit_reason": long_exit_signal.reason,
-        },
-    )
+    short_entry.meta = {
+        **(short_entry.meta or {}),
+        "source_exit_reason": long_exit_signal.reason,
+    }
+    return short_entry
 
 
 def generate_emergency_exit_signal(
@@ -543,7 +594,8 @@ def generate_exit_signal(
     Exit logic for BEE7:
       - emergency long stop is disabled by default
       - remaining long closes when H1/H4 close levels are met and H1 momentum weakens
-      - remaining short closes when the normal long-entry signal appears
+      - remaining long reverses when a valid mirrored short-entry signal appears
+      - remaining short closes on mirrored low-zone H1/H4 levels or reverses on long entry
     """
     position.bars_in_position += 1
 
@@ -592,6 +644,17 @@ def generate_exit_signal(
             )
         if _cross_down(bar, prev_bar):
             position.h1_red_close_count += 1
+        short_entry = generate_entry_signal(bar, prev_bar, params, None)
+        if short_entry.action == "open_short":
+            meta = _meta("WT_SHORT_SIGNAL_EXIT_LONG")
+            meta["h1_red_close_count"] = position.h1_red_close_count
+            meta["short_entry_reason"] = short_entry.reason
+            meta["short_entry_cross_type"] = (short_entry.meta or {}).get("cross_type", "")
+            return Signal(
+                action="close_force",
+                reason="WT_SHORT_SIGNAL_EXIT_LONG",
+                meta=meta,
+            )
         if _long_close_level_ok(bar, params) and _long_exit_momentum_weakening(bar, prev_bar):
             meta = _meta("WT_HIGH_ZONE_H1_MOMENTUM_EXIT_LONG")
             meta["h1_red_close_count"] = position.h1_red_close_count
@@ -637,6 +700,28 @@ def generate_exit_signal(
             return Signal(
                 action="close_force",
                 reason="WT_LONG_SIGNAL_EXIT_SHORT",
+                meta=meta,
+            )
+        if _cross_up(bar, prev_bar):
+            position.h1_green_close_count += 1
+        if _short_close_level_ok(bar, params) and _short_exit_momentum_strengthening(bar, prev_bar):
+            meta = _meta("WT_LOW_ZONE_H1_MOMENTUM_EXIT_SHORT")
+            meta["h1_green_close_count"] = position.h1_green_close_count
+            meta["short_close_level_h1"] = float(
+                params.get(
+                    "wt_short_close_max_level",
+                    params.get("wt_short_exit_max_level", -float(params.get("wt_long_close_min_level", 0.0))),
+                )
+            )
+            meta["short_close_level_h4"] = float(
+                params.get("wt_h4_short_close_max", -float(params.get("wt_h4_long_close_min", 0.0)))
+            )
+            meta["exit_momentum_strengthening"] = True
+            meta["exit_wt1_slope"] = round(bar.wt1 - prev_bar.wt1, 4)
+            meta["exit_delta_slope"] = round(bar.wt_delta - prev_bar.wt_delta, 4)
+            return Signal(
+                action="close_force",
+                reason="WT_LOW_ZONE_H1_MOMENTUM_EXIT_SHORT",
                 meta=meta,
             )
 

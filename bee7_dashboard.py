@@ -24,10 +24,10 @@ from bee7_params import (
     WT_EMA_FILTER_LEN_OPTIONS,
     WT_LONG_ENTRY_MAX_ABOVE_ZERO_GRID, WT_LONG_ENTRY_MAX_ABOVE_ZERO_OPTIONS,
     WT_LONG_CLOSE_MIN_LEVEL_GRID, WT_LONG_CLOSE_MIN_LEVEL_OPTIONS,
-    WT_SHORT_ENTRY_MIN_BELOW_ZERO_GRID, WT_SHORT_ENTRY_MIN_BELOW_ZERO_OPTIONS,
+    WT_SHORT_ENTRY_MIN_BELOW_ZERO_OPTIONS,
     WT_H4_LONG_FILTER_MAX_GRID, WT_H4_LONG_FILTER_MAX_OPTIONS,
     WT_H4_LONG_CLOSE_MIN_GRID, WT_H4_LONG_CLOSE_MIN_OPTIONS,
-    WT_H4_SHORT_FILTER_MIN_GRID, WT_H4_SHORT_FILTER_MIN_OPTIONS,
+    WT_H4_SHORT_FILTER_MIN_OPTIONS,
     WT_LONG_EMERGENCY_SL_CAPITAL_PCT_GRID, WT_LONG_EMERGENCY_SL_CAPITAL_PCT_OPTIONS,
 )
 from bee7_data     import (
@@ -272,8 +272,7 @@ def _clean_selected_values(values, fallback, caster):
 
 
 def _direction_flags(direction) -> tuple[str, bool, bool]:
-    # BEE7 reverse-short experiment: long signals stay primary, while a normal
-    # long exit may open short and the next long signal closes it.
+    # BEE7 mirrors long signals into short signals and keeps both directions on.
     return "both", True, True
 
 
@@ -311,6 +310,26 @@ def _strategy_params_from_controls(
         long_sl_pct,
         float(DEFAULT_PARAMS.get("wt_long_emergency_sl_capital_pct", 0.0)),
     )
+    long_entry_level = float(
+        long_zone if long_zone not in (None, "") else DEFAULT_PARAMS["wt_long_entry_max_above_zero"]
+    )
+    long_close_h1 = float(
+        long_close_level
+        if long_close_level not in (None, "")
+        else DEFAULT_PARAMS["wt_long_close_min_level"]
+    )
+    h4_long_open = float(
+        h4_long_filter if h4_long_filter not in (None, "") else DEFAULT_PARAMS["wt_h4_long_filter_max"]
+    )
+    h4_long_close = float(
+        h4_long_close_level
+        if h4_long_close_level not in (None, "")
+        else DEFAULT_PARAMS["wt_h4_long_close_min"]
+    )
+    short_entry_level = abs(long_entry_level)
+    short_close_h1 = -abs(long_close_h1)
+    h4_short_open = abs(h4_long_open)
+    h4_short_close = -abs(h4_long_close)
     params.update(
         {
             "trade_direction": trade_direction,
@@ -336,33 +355,16 @@ def _strategy_params_from_controls(
             "wt_long_require_htf_trend": False,
             "wt_short_require_htf_trend": False,
             "wt_ema_filter_len": int(DEFAULT_PARAMS["wt_ema_filter_len"]),
-            "wt_long_entry_max_above_zero": float(
-                long_zone if long_zone not in (None, "") else DEFAULT_PARAMS["wt_long_entry_max_above_zero"]
-            ),
-            "wt_long_close_min_level": float(
-                long_close_level
-                if long_close_level not in (None, "")
-                else DEFAULT_PARAMS["wt_long_close_min_level"]
-            ),
-            "wt_long_exit_min_level": float(
-                long_close_level
-                if long_close_level not in (None, "")
-                else DEFAULT_PARAMS["wt_long_close_min_level"]
-            ),
-            "wt_short_entry_min_below_zero": float(
-                short_zone if short_zone not in (None, "") else DEFAULT_PARAMS["wt_short_entry_min_below_zero"]
-            ),
-            "wt_h4_long_filter_max": float(
-                h4_long_filter if h4_long_filter not in (None, "") else DEFAULT_PARAMS["wt_h4_long_filter_max"]
-            ),
-            "wt_h4_long_close_min": float(
-                h4_long_close_level
-                if h4_long_close_level not in (None, "")
-                else DEFAULT_PARAMS["wt_h4_long_close_min"]
-            ),
-            "wt_h4_short_filter_min": float(
-                h4_short_filter if h4_short_filter not in (None, "") else DEFAULT_PARAMS["wt_h4_short_filter_min"]
-            ),
+            "wt_long_entry_max_above_zero": long_entry_level,
+            "wt_long_close_min_level": long_close_h1,
+            "wt_long_exit_min_level": long_close_h1,
+            "wt_short_entry_min_below_zero": short_entry_level,
+            "wt_short_close_max_level": short_close_h1,
+            "wt_short_exit_max_level": short_close_h1,
+            "wt_h4_long_filter_max": h4_long_open,
+            "wt_h4_long_close_min": h4_long_close,
+            "wt_h4_short_filter_min": h4_short_open,
+            "wt_h4_short_close_max": h4_short_close,
             "wt_long_tp1_enabled": True,
             "wt_long_tp1_pct": float(
                 (long_tp1_pct if long_tp1_pct not in (None, "") else DEFAULT_PARAMS.get("wt_long_tp1_pct", 0.01) * 100.0)
@@ -430,7 +432,6 @@ def _grid_overrides_from_controls(
             WT_LONG_CLOSE_MIN_LEVEL_GRID,
             float,
         ),
-        "wt_short_entry_min_below_zero": [float(DEFAULT_PARAMS["wt_short_entry_min_below_zero"])],
         "wt_h4_long_filter_max": _clean_selected_values(
             h4_long_filter_grid,
             WT_H4_LONG_FILTER_MAX_GRID,
@@ -446,7 +447,6 @@ def _grid_overrides_from_controls(
             WT_LONG_EMERGENCY_SL_CAPITAL_PCT_GRID,
             float,
         ),
-        "wt_h4_short_filter_min": [float(DEFAULT_PARAMS["wt_h4_short_filter_min"])],
     }
 
 
@@ -462,8 +462,12 @@ PARAM_SUMMARY_ORDER = [
     "wt_long_entry_window_bars",
     "wt_long_entry_max_above_zero",
     "wt_long_close_min_level",
+    "wt_short_entry_min_below_zero",
+    "wt_short_close_max_level",
     "wt_h4_long_filter_max",
     "wt_h4_long_close_min",
+    "wt_h4_short_filter_min",
+    "wt_h4_short_close_max",
     "wt_long_emergency_sl_capital_pct",
     "wt_long_tp1_pct",
     "wt_long_tp1_fraction",
@@ -478,8 +482,12 @@ PARAM_SUMMARY_LABELS = {
     "wt_long_entry_window_bars": "Entry window H1",
     "wt_long_entry_max_above_zero": "Long open level H1",
     "wt_long_close_min_level": "Long close level H1",
+    "wt_short_entry_min_below_zero": "Short open level H1",
+    "wt_short_close_max_level": "Short close level H1",
     "wt_h4_long_filter_max": "Long open level H4",
     "wt_h4_long_close_min": "Long close level H4",
+    "wt_h4_short_filter_min": "Short open level H4",
+    "wt_h4_short_close_max": "Short close level H4",
     "wt_long_emergency_sl_capital_pct": "Stop loss",
     "wt_long_tp1_pct": "Long TP1",
     "wt_long_tp1_fraction": "Long TP1 fraction",
@@ -2394,7 +2402,7 @@ def sidebar():
                 {"label": "WFO", "value": "wfo"},
             ], "wfo")),
             field("Kierunek", drp("inp-direction", [
-                {"label": "Long + reverse short", "value": "both"},
+                {"label": "Long + mirror short", "value": "both"},
             ], "both")),
             html.Div([
                 html.Div([field("Fee rate %", inp("inp-fee", round(FEE_RATE*100,4),
@@ -2456,7 +2464,7 @@ def sidebar():
                 html.Div([field("EMA length", inp("inp-bt-ema-len", DEFAULT_PARAMS["wt_ema_filter_len"], type="number", min=2, max=200, step=1))], style={"display":"none"}),
             ], style={"display":"flex","gap":"8px"}),
             html.Div(
-                "BEE7: short otwiera się po normalnym zamknięciu longa i zamyka się na kolejnym sygnale long. TP1/TP2 i break-even po TP1 działają lustrzanie dla long i short. WFO nadal optymalizuje poziomy long open/close H1/H4.",
+                "BEE7: short ma lustrzane wejscie i wyjscie wzgledem longa. Przeciwny sygnal zamyka aktywna pozycje i otwiera druga strone na tym samym barze. TP1/TP2 i break-even po TP1 dzialaja dla long i short.",
                 style={"fontSize":"11px","color":C["muted"],"marginTop":"4px"},
             ),
         ],style=card_s),
@@ -2593,7 +2601,7 @@ def sidebar():
                     labelStyle={"color":"#e8eaf6","fontSize":"12px","marginRight":"10px"}),
             ], style={"display":"none"}),
             html.Div(
-                "WFO w BEE7 testuje entry window H1, long open level H1/H4, long close level H1/H4 oraz stop loss. Short korzysta z tych samych punktów przełączenia: start po long close i koniec przy long open.",
+                "WFO w BEE7 testuje entry window H1, long open level H1/H4, long close level H1/H4 oraz stop loss. Progi short sa liczone jako lustrzane odbicie wybranych progow long.",
                 style={"fontSize":"11px","color":C["muted"],"marginTop":"8px"},
             ),
         ],id="panel-wfo",style=card_s),

@@ -56,16 +56,18 @@ BASE_PARAMS = {
     "wt_long_exit_min_level": 40.0,
     "wt_long_require_ema20_reclaim": False,
     "wt_long_require_htf_trend": False,
-    "wt_short_entry_window_bars": 0,
+    "wt_short_entry_window_bars": 3,
     "wt_short_entry_min_below_zero": 30.0,
-    "wt_short_exit_max_level": 0.0,
+    "wt_short_close_max_level": -40.0,
+    "wt_short_exit_max_level": -40.0,
     "wt_short_require_ema20_reject": False,
     "wt_short_require_htf_trend": False,
     "wt_ema_filter_len": 20,
     "wt_h4_filter_interval": "4h",
     "wt_h4_long_filter_max": 20.0,
     "wt_h4_long_close_min": 10.0,
-    "wt_h4_short_filter_min": 50.0,
+    "wt_h4_short_filter_min": 20.0,
+    "wt_h4_short_close_max": -10.0,
     "wt_long_tp1_enabled": True,
     "wt_long_tp1_pct": 0.01,
     "wt_long_tp1_fraction": 1.0 / 3.0,
@@ -235,9 +237,9 @@ def _short_cycle_df() -> pd.DataFrame:
     highs = [1804.0, 1812.0, 1806.0, 1786.0, 1770.0, 1774.0]
     lows = [1796.0, 1804.0, 1794.0, 1778.0, 1762.0, 1764.0]
     wt1_vals = [-48.0, -34.0, 50.0, 45.0, -48.0, -34.0]
-    wt2_vals = [-42.0, -44.0, 56.0, 55.0, -44.0, -44.0]
-    h4_wt1_vals = [-34.0, -28.0, 58.0, 60.0, -34.0, -28.0]
-    h4_wt2_vals = [-22.0, -22.0, 52.0, 52.0, -22.0, -22.0]
+    wt2_vals = [-42.0, -44.0, 56.0, 55.0, -35.0, -44.0]
+    h4_wt1_vals = [15.0, 20.0, 58.0, 60.0, -34.0, -28.0]
+    h4_wt2_vals = [15.0, 10.0, 52.0, 52.0, -22.0, -22.0]
 
     df = pd.DataFrame(
         {
@@ -414,7 +416,7 @@ class TestEntrySignals:
 
         assert sig.action == "none"
 
-    def test_direct_short_entry_is_disabled_even_when_shorts_are_enabled(self):
+    def test_direct_short_entry_opens_on_mirrored_red_signal(self):
         prev = _make_bar(
             wt1=48.0,
             wt2=42.0,
@@ -434,9 +436,11 @@ class TestEntrySignals:
 
         sig = generate_entry_signal(bar, prev, BASE_PARAMS, None)
 
-        assert sig.action == "none"
+        assert sig.action == "open_short"
+        assert sig.reason == "WT_H1_RED_WINDOW_H4_SOFT_FILTER"
+        assert sig.meta["cross_type"] == "bearish"
 
-    def test_short_reversal_opens_after_normal_long_exit(self):
+    def test_short_reversal_opens_after_short_signal_closes_long(self):
         prev = _make_bar(
             wt1=48.0,
             wt2=42.0,
@@ -462,8 +466,11 @@ class TestEntrySignals:
         )
         sig = generate_short_reversal_entry_signal(bar, prev, SHORTS_ENABLED_PARAMS, long_exit)
 
+        assert long_exit.action == "close_force"
+        assert long_exit.reason == "WT_SHORT_SIGNAL_EXIT_LONG"
         assert sig.action == "open_short"
-        assert sig.reason == "LONG_EXIT_REVERSE_SHORT"
+        assert sig.reason == "WT_H1_RED_WINDOW_H4_SOFT_FILTER"
+        assert sig.meta["source_exit_reason"] == "WT_SHORT_SIGNAL_EXIT_LONG"
 
     def test_direction_filter_blocks_short_in_long_only_mode(self):
         prev = _make_bar(
@@ -728,7 +735,7 @@ class TestExitSignals:
         assert sig.exit_price == pytest.approx(1800.0)
         assert sig.meta["remaining_fraction_before"] == pytest.approx(2.0 / 3.0)
 
-    def test_h1_red_dot_can_close_long_without_opening_short(self):
+    def test_h1_red_dot_with_short_signal_closes_long_for_reversal(self):
         prev = _make_bar(
             wt1=48.0,
             wt2=42.0,
@@ -750,7 +757,8 @@ class TestExitSignals:
         sig = generate_exit_signal(bar, prev, BASE_PARAMS, pos)
 
         assert sig.action == "close_force"
-        assert sig.reason == "WT_HIGH_ZONE_H1_MOMENTUM_EXIT_LONG"
+        assert sig.reason == "WT_SHORT_SIGNAL_EXIT_LONG"
+        assert sig.meta["short_entry_reason"] == "WT_H1_RED_WINDOW_H4_SOFT_FILTER"
 
     def test_h1_red_dot_exit_still_works_in_long_only_mode(self):
         prev = _make_bar(
@@ -993,6 +1001,32 @@ class TestExitSignals:
 
         assert sig.action == "none"
 
+    def test_mirrored_low_zone_exit_closes_short_without_long_signal(self):
+        prev = _make_bar(
+            wt1=-58.0,
+            wt2=-52.0,
+            h4_wt1=-28.0,
+            h4_wt2=-22.0,
+            h4_prev_wt1=-24.0,
+            h4_prev_wt2=-22.0,
+        )
+        bar = _make_bar(
+            wt1=-50.0,
+            wt2=-56.0,
+            h4_wt1=-34.0,
+            h4_wt2=-22.0,
+            h4_prev_wt1=-28.0,
+            h4_prev_wt2=-22.0,
+        )
+        pos = PositionState(side="short", entry_price=1800.0, entry_time=bar.time)
+
+        sig = generate_exit_signal(bar, prev, BASE_PARAMS, pos)
+
+        assert sig.action == "close_force"
+        assert sig.reason == "WT_LOW_ZONE_H1_MOMENTUM_EXIT_SHORT"
+        assert sig.meta["short_close_level_h1"] == pytest.approx(-40.0)
+        assert sig.meta["short_close_level_h4"] == pytest.approx(-10.0)
+
     def test_long_entry_signal_closes_short(self):
         prev = _make_bar(
             wt1=-48.0,
@@ -1185,7 +1219,7 @@ class TestBacktestAccounting:
 
         assert list(trades["side"]) == ["long", "short", "short", "short"]
         assert list(trades["reason"]) == [
-            "WT_HIGH_ZONE_H1_MOMENTUM_EXIT_LONG",
+            "WT_SHORT_SIGNAL_EXIT_LONG",
             "SHORT_TP1_PARTIAL",
             "SHORT_TP2_PARTIAL",
             "WT_LONG_SIGNAL_EXIT_SHORT",
@@ -1291,9 +1325,11 @@ class TestWFOHelpers:
                 "best_wt_long_entry_max_above_zero": [-30.0, -30.0, -40.0],
                 "best_wt_long_close_min_level": [0.0, 10.0, 10.0],
                 "best_wt_short_entry_min_below_zero": [30.0, 30.0, 40.0],
+                "best_wt_short_close_max_level": [0.0, -10.0, -10.0],
                 "best_wt_h4_long_filter_max": [-20.0, -20.0, -30.0],
                 "best_wt_h4_long_close_min": [0.0, 20.0, 20.0],
-                "best_wt_h4_short_filter_min": [50.0, 50.0, 60.0],
+                "best_wt_h4_short_filter_min": [20.0, 20.0, 30.0],
+                "best_wt_h4_short_close_max": [0.0, -20.0, -20.0],
                 "best_wt_long_emergency_sl_capital_pct": [0.0, 0.05, 0.05],
                 "allow_longs": [True, True, True],
                 "allow_shorts": [False, False, False],
@@ -1314,9 +1350,12 @@ class TestWFOHelpers:
         assert best["wt_long_close_min_level"] == pytest.approx(10.0)
         assert best["wt_long_exit_min_level"] == pytest.approx(10.0)
         assert best["wt_short_entry_min_below_zero"] == pytest.approx(30.0)
+        assert best["wt_short_close_max_level"] == pytest.approx(-10.0)
+        assert best["wt_short_exit_max_level"] == pytest.approx(-10.0)
         assert best["wt_h4_long_filter_max"] == pytest.approx(-20.0)
         assert best["wt_h4_long_close_min"] == pytest.approx(20.0)
-        assert best["wt_h4_short_filter_min"] == pytest.approx(50.0)
+        assert best["wt_h4_short_filter_min"] == pytest.approx(20.0)
+        assert best["wt_h4_short_close_max"] == pytest.approx(-20.0)
         assert best["wt_long_emergency_sl_enabled"] is True
         assert best["wt_long_emergency_sl_capital_pct"] == pytest.approx(0.05)
 
@@ -1347,10 +1386,8 @@ class TestWFOHelpers:
             "wt_ema_filter_len": [20],
             "wt_long_entry_max_above_zero": [-30.0],
             "wt_long_close_min_level": [0.0],
-            "wt_short_entry_min_below_zero": [30.0],
             "wt_h4_long_filter_max": [-20.0],
             "wt_h4_long_close_min": [0.0],
-            "wt_h4_short_filter_min": [50.0],
             "wt_long_emergency_sl_capital_pct": [0.05],
         }
 
@@ -1374,9 +1411,11 @@ class TestWFOHelpers:
         assert set(windows_df["best_wt_long_entry_max_above_zero"]) == {-30.0}
         assert set(windows_df["best_wt_long_close_min_level"]) == {0.0}
         assert set(windows_df["best_wt_short_entry_min_below_zero"]) == {30.0}
+        assert set(windows_df["best_wt_short_close_max_level"]) == {0.0}
         assert set(windows_df["best_wt_h4_long_filter_max"]) == {-20.0}
         assert set(windows_df["best_wt_h4_long_close_min"]) == {0.0}
-        assert set(windows_df["best_wt_h4_short_filter_min"]) == {50.0}
+        assert set(windows_df["best_wt_h4_short_filter_min"]) == {20.0}
+        assert set(windows_df["best_wt_h4_short_close_max"]) == {0.0}
         assert set(windows_df["best_wt_long_emergency_sl_capital_pct"]) == {0.05}
         assert set(windows_df["best_wt_long_emergency_sl_enabled"]) == {True}
 

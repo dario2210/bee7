@@ -39,9 +39,10 @@ WT_LONG_CLOSE_MIN_LEVEL = 40.0
 WT_LONG_EXIT_MIN_LEVEL = WT_LONG_CLOSE_MIN_LEVEL
 WT_LONG_REQUIRE_EMA20_RECLAIM = False
 WT_LONG_REQUIRE_HTF_TREND = False
-WT_SHORT_ENTRY_WINDOW_BARS = 0
+WT_SHORT_ENTRY_WINDOW_BARS = WT_LONG_ENTRY_WINDOW_BARS
 WT_SHORT_ENTRY_MIN_BELOW_ZERO = 30.0
-WT_SHORT_EXIT_MAX_LEVEL = 0.0
+WT_SHORT_CLOSE_MAX_LEVEL = -WT_LONG_CLOSE_MIN_LEVEL
+WT_SHORT_EXIT_MAX_LEVEL = WT_SHORT_CLOSE_MAX_LEVEL
 WT_SHORT_REQUIRE_EMA20_REJECT = False
 WT_SHORT_REQUIRE_HTF_TREND = False
 WT_EMA_FILTER_LEN = 20
@@ -50,7 +51,8 @@ HTF_EMA_INTERVAL = "4h"
 WT_H4_FILTER_INTERVAL = "4h"
 WT_H4_LONG_FILTER_MAX = 20.0
 WT_H4_LONG_CLOSE_MIN = 10.0
-WT_H4_SHORT_FILTER_MIN = 50.0
+WT_H4_SHORT_FILTER_MIN = abs(WT_H4_LONG_FILTER_MAX)
+WT_H4_SHORT_CLOSE_MAX = -WT_H4_LONG_CLOSE_MIN
 WT_LONG_TP1_ENABLED = True
 WT_LONG_TP1_PCT = 0.01
 WT_LONG_TP1_FRACTION = 1.0 / 3.0
@@ -100,12 +102,16 @@ WT_LONG_CLOSE_MIN_LEVEL_GRID = [40.0, 50.0, 60.0, 70.0]
 WT_LONG_CLOSE_MIN_LEVEL_OPTIONS = [40.0, 50.0, 60.0, 70.0]
 WT_SHORT_ENTRY_MIN_BELOW_ZERO_GRID = [30.0, 40.0, 50.0, 60.0]
 WT_SHORT_ENTRY_MIN_BELOW_ZERO_OPTIONS = [30.0, 40.0, 50.0, 60.0]
+WT_SHORT_CLOSE_MAX_LEVEL_GRID = [-70.0, -60.0, -50.0, -40.0]
+WT_SHORT_CLOSE_MAX_LEVEL_OPTIONS = [-70.0, -60.0, -50.0, -40.0]
 WT_H4_LONG_FILTER_MAX_GRID = [-70.0, -60.0, -50.0, -40.0, -30.0, -20.0, -10.0]
 WT_H4_LONG_FILTER_MAX_OPTIONS = [-70.0, -60.0, -50.0, -40.0, -30.0, -20.0, -10.0]
 WT_H4_LONG_CLOSE_MIN_GRID = [30.0, 40.0, 50.0, 60.0, 70.0]
 WT_H4_LONG_CLOSE_MIN_OPTIONS = [30.0, 40.0, 50.0, 60.0, 70.0]
 WT_H4_SHORT_FILTER_MIN_GRID = [30.0, 40.0, 50.0, 60.0]
 WT_H4_SHORT_FILTER_MIN_OPTIONS = [30.0, 40.0, 50.0, 60.0]
+WT_H4_SHORT_CLOSE_MAX_GRID = [-70.0, -60.0, -50.0, -40.0, -30.0]
+WT_H4_SHORT_CLOSE_MAX_OPTIONS = [-70.0, -60.0, -50.0, -40.0, -30.0]
 WT_LONG_EMERGENCY_SL_CAPITAL_PCT_GRID = [0.0, 0.01, 0.02, 0.05, 0.10]
 WT_LONG_EMERGENCY_SL_CAPITAL_PCT_OPTIONS = [0.0, 0.01, 0.02, 0.05, 0.10]
 
@@ -140,6 +146,7 @@ DEFAULT_PARAMS = {
     "wt_long_require_htf_trend": WT_LONG_REQUIRE_HTF_TREND,
     "wt_short_entry_window_bars": WT_SHORT_ENTRY_WINDOW_BARS,
     "wt_short_entry_min_below_zero": WT_SHORT_ENTRY_MIN_BELOW_ZERO,
+    "wt_short_close_max_level": WT_SHORT_CLOSE_MAX_LEVEL,
     "wt_short_exit_max_level": WT_SHORT_EXIT_MAX_LEVEL,
     "wt_short_require_ema20_reject": WT_SHORT_REQUIRE_EMA20_REJECT,
     "wt_short_require_htf_trend": WT_SHORT_REQUIRE_HTF_TREND,
@@ -148,6 +155,7 @@ DEFAULT_PARAMS = {
     "wt_h4_long_filter_max": WT_H4_LONG_FILTER_MAX,
     "wt_h4_long_close_min": WT_H4_LONG_CLOSE_MIN,
     "wt_h4_short_filter_min": WT_H4_SHORT_FILTER_MIN,
+    "wt_h4_short_close_max": WT_H4_SHORT_CLOSE_MAX,
     "wt_long_tp1_enabled": WT_LONG_TP1_ENABLED,
     "wt_long_tp1_pct": WT_LONG_TP1_PCT,
     "wt_long_tp1_fraction": WT_LONG_TP1_FRACTION,
@@ -206,8 +214,8 @@ def load_params() -> dict:
     else:
         print(f"[params] Missing {WFO_BEST_PARAMS_PATH} - using DEFAULT_PARAMS")
 
-    # BEE7 runs the reverse-short experiment: normal long exits can open short,
-    # and normal long entries close short.
+    # BEE7 runs mirrored long/short signals with the long grid as the source
+    # of paired inverse short thresholds.
     params["trade_direction"] = "both"
     params["allow_longs"] = True
     params["allow_shorts"] = True

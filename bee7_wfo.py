@@ -45,10 +45,8 @@ from bee7_params import (
     WT_H4_LONG_CLOSE_MIN,
     WT_H4_LONG_CLOSE_MIN_GRID,
     WT_H4_SHORT_FILTER_MIN,
-    WT_H4_SHORT_FILTER_MIN_GRID,
-    WT_SHORT_REQUIRE_HTF_TREND,
-    WT_SHORT_ENTRY_MIN_BELOW_ZERO,
-    WT_SHORT_ENTRY_MIN_BELOW_ZERO_GRID,
+    WT_H4_SHORT_CLOSE_MAX,
+    WT_SHORT_CLOSE_MAX_LEVEL,
     WT_USE_EMA_FILTER_GRID,
     WT_USE_HTF_TREND_FILTER_GRID,
 )
@@ -154,9 +152,6 @@ def walk_forward_optimization(
         WT_LONG_CLOSE_MIN_LEVEL_GRID,
         float,
     )
-    # In the BEE7 reverse-short experiment, short entries do not use their own
-    # H1/H4 filters. They are opened only after the normal long close signal.
-    short_zone_grid = [WT_SHORT_ENTRY_MIN_BELOW_ZERO]
     h4_long_filter_grid = _clean_grid(
         grid_overrides.get("wt_h4_long_filter_max"),
         WT_H4_LONG_FILTER_MAX_GRID,
@@ -172,7 +167,6 @@ def walk_forward_optimization(
         WT_LONG_EMERGENCY_SL_CAPITAL_PCT_GRID,
         float,
     )
-    h4_short_filter_grid = [WT_H4_SHORT_FILTER_MIN]
     n = len(df)
     start = 0
     window_id = 0
@@ -196,11 +190,9 @@ def walk_forward_optimization(
         * len(ema_len_grid)
         * len(long_zone_grid)
         * len(long_close_min_level_grid)
-        * len(short_zone_grid)
         * len(h4_long_filter_grid)
         * len(h4_long_close_min_grid)
         * len(long_emergency_sl_grid)
-        * len(h4_short_filter_grid)
     )
     combo_progress_step = max(1, combo_total // 20)
     if verbose:
@@ -256,9 +248,7 @@ def walk_forward_optimization(
             wt_ema_filter_len,
             wt_long_entry_max_above_zero,
             wt_long_close_min_level,
-            wt_short_entry_min_below_zero,
             wt_h4_long_filter_max,
-            wt_h4_short_filter_min,
             wt_h4_long_close_min,
             wt_long_emergency_sl_capital_pct,
         ) in product(
@@ -272,9 +262,7 @@ def walk_forward_optimization(
             ema_len_grid,
             long_zone_grid,
             long_close_min_level_grid,
-            short_zone_grid,
             h4_long_filter_grid,
-            h4_short_filter_grid,
             h4_long_close_min_grid,
             long_emergency_sl_grid,
         ):
@@ -291,6 +279,10 @@ def walk_forward_optimization(
                 on_combo_progress(window_id, total_windows, combo_idx, combo_total)
 
             params = dict(base_params)
+            wt_short_entry_min_below_zero = abs(float(wt_long_entry_max_above_zero))
+            wt_short_close_max_level = -abs(float(wt_long_close_min_level))
+            wt_h4_short_filter_min = abs(float(wt_h4_long_filter_max))
+            wt_h4_short_close_max = -abs(float(wt_h4_long_close_min))
             params.update(
                 {
                     "wt_channel_len": wt_channel_len,
@@ -308,9 +300,12 @@ def walk_forward_optimization(
                     "wt_long_close_min_level": wt_long_close_min_level,
                     "wt_long_exit_min_level": wt_long_close_min_level,
                     "wt_short_entry_min_below_zero": wt_short_entry_min_below_zero,
+                    "wt_short_close_max_level": wt_short_close_max_level,
+                    "wt_short_exit_max_level": wt_short_close_max_level,
                     "wt_h4_long_filter_max": wt_h4_long_filter_max,
                     "wt_h4_short_filter_min": wt_h4_short_filter_min,
                     "wt_h4_long_close_min": wt_h4_long_close_min,
+                    "wt_h4_short_close_max": wt_h4_short_close_max,
                     "wt_long_emergency_sl_enabled": wt_long_emergency_sl_capital_pct > 0.0,
                     "wt_long_emergency_sl_capital_pct": wt_long_emergency_sl_capital_pct,
                 }
@@ -405,9 +400,17 @@ def walk_forward_optimization(
                 WT_LONG_CLOSE_MIN_LEVEL,
             )
             trades_live["wt_short_entry_min_below_zero"] = best_params["wt_short_entry_min_below_zero"]
+            trades_live["wt_short_close_max_level"] = best_params.get(
+                "wt_short_close_max_level",
+                WT_SHORT_CLOSE_MAX_LEVEL,
+            )
             trades_live["wt_h4_long_filter_max"] = best_params.get("wt_h4_long_filter_max", WT_H4_LONG_FILTER_MAX)
             trades_live["wt_h4_long_close_min"] = best_params.get("wt_h4_long_close_min", WT_H4_LONG_CLOSE_MIN)
             trades_live["wt_h4_short_filter_min"] = best_params.get("wt_h4_short_filter_min", WT_H4_SHORT_FILTER_MIN)
+            trades_live["wt_h4_short_close_max"] = best_params.get(
+                "wt_h4_short_close_max",
+                WT_H4_SHORT_CLOSE_MAX,
+            )
             trades_live["wt_long_emergency_sl_capital_pct"] = best_params.get(
                 "wt_long_emergency_sl_capital_pct",
                 WT_LONG_EMERGENCY_SL_CAPITAL_PCT,
@@ -450,9 +453,17 @@ def walk_forward_optimization(
                     WT_LONG_CLOSE_MIN_LEVEL,
                 ),
                 "best_wt_short_entry_min_below_zero": best_params["wt_short_entry_min_below_zero"],
+                "best_wt_short_close_max_level": best_params.get(
+                    "wt_short_close_max_level",
+                    WT_SHORT_CLOSE_MAX_LEVEL,
+                ),
                 "best_wt_h4_long_filter_max": best_params.get("wt_h4_long_filter_max", WT_H4_LONG_FILTER_MAX),
                 "best_wt_h4_long_close_min": best_params.get("wt_h4_long_close_min", WT_H4_LONG_CLOSE_MIN),
                 "best_wt_h4_short_filter_min": best_params.get("wt_h4_short_filter_min", WT_H4_SHORT_FILTER_MIN),
+                "best_wt_h4_short_close_max": best_params.get(
+                    "wt_h4_short_close_max",
+                    WT_H4_SHORT_CLOSE_MAX,
+                ),
                 "best_wt_long_emergency_sl_capital_pct": best_params.get(
                     "wt_long_emergency_sl_capital_pct",
                     WT_LONG_EMERGENCY_SL_CAPITAL_PCT,
@@ -490,7 +501,7 @@ def walk_forward_optimization(
                 f"open_h4={best_params.get('wt_h4_long_filter_max', WT_H4_LONG_FILTER_MAX):.1f} "
                 f"close_h4={best_params.get('wt_h4_long_close_min', WT_H4_LONG_CLOSE_MIN):.1f} "
                 f"sl={best_params.get('wt_long_emergency_sl_capital_pct', WT_LONG_EMERGENCY_SL_CAPITAL_PCT) * 100:.0f}% "
-                f"short=reverse"
+                f"short=mirror"
             )
 
         if on_window_done is not None:
@@ -564,11 +575,6 @@ def get_latest_best_params(windows_df: pd.DataFrame) -> dict:
         if "best_wt_long_close_min_level" in recent.columns
         else WT_LONG_CLOSE_MIN_LEVEL
     )
-    short_entry_min_below_zero = (
-        float(recent["best_wt_short_entry_min_below_zero"].mode().iloc[0])
-        if "best_wt_short_entry_min_below_zero" in recent.columns
-        else WT_SHORT_ENTRY_MIN_BELOW_ZERO
-    )
     h4_long_filter_max = (
         float(recent["best_wt_h4_long_filter_max"].mode().iloc[0])
         if "best_wt_h4_long_filter_max" in recent.columns
@@ -579,11 +585,10 @@ def get_latest_best_params(windows_df: pd.DataFrame) -> dict:
         if "best_wt_h4_long_close_min" in recent.columns
         else WT_H4_LONG_CLOSE_MIN
     )
-    h4_short_filter_min = (
-        float(recent["best_wt_h4_short_filter_min"].mode().iloc[0])
-        if "best_wt_h4_short_filter_min" in recent.columns
-        else WT_H4_SHORT_FILTER_MIN
-    )
+    short_entry_min_below_zero = abs(float(long_entry_max_above_zero))
+    short_close_max_level = -abs(float(long_close_min_level))
+    h4_short_filter_min = abs(float(h4_long_filter_max))
+    h4_short_close_max = -abs(float(h4_long_close_min))
     long_emergency_sl_capital_pct = (
         float(recent["best_wt_long_emergency_sl_capital_pct"].mode().iloc[0])
         if "best_wt_long_emergency_sl_capital_pct" in recent.columns
@@ -613,9 +618,12 @@ def get_latest_best_params(windows_df: pd.DataFrame) -> dict:
         "wt_long_close_min_level": long_close_min_level,
         "wt_long_exit_min_level": long_close_min_level,
         "wt_short_entry_min_below_zero": short_entry_min_below_zero,
+        "wt_short_close_max_level": short_close_max_level,
+        "wt_short_exit_max_level": short_close_max_level,
         "wt_h4_long_filter_max": h4_long_filter_max,
         "wt_h4_long_close_min": h4_long_close_min,
         "wt_h4_short_filter_min": h4_short_filter_min,
+        "wt_h4_short_close_max": h4_short_close_max,
         "wt_long_emergency_sl_enabled": long_emergency_sl_capital_pct > 0.0,
         "wt_long_emergency_sl_capital_pct": long_emergency_sl_capital_pct,
     }

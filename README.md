@@ -5,10 +5,11 @@ Dashboard, wykres, flow backtest/WFO/live oraz uklad plikow pozostaja spojne z w
 
 ## Co robi projekt
 
-- domyslnie pracuje w trybie `long/short reverse`
+- domyslnie pracuje w trybie `long/short mirror`
 - otwiera `long` na zielonej kropce WaveTrend pod zerem oraz w oknie kilku barow po tym sygnale
-- otwiera `short` dopiero po normalnym zamknieciu longa na sygnale `long close`
-- zamyka `short` wtedy, gdy pojawia sie standardowy sygnal wejscia `long`
+- otwiera `short` na czerwonej kropce WaveTrend nad zerem oraz w oknie kilku barow po tym sygnale
+- zamyka `short` na lustrzanym sygnale wyjscia w niskiej strefie H1/H4 albo przelacza na `long`, gdy pojawia sie standardowy sygnal wejscia `long`
+- zamyka `long` i przelacza na `short`, gdy pelny sygnal short pojawia sie przy otwartym longu
 - prowadzi `long` i `short` przez TP1, TP2 oraz break-even po TP1
 - dopuszcza re-entry longa, gdy WaveTrend nadal utrzymuje sie blisko zera po ostatniej zielonej kropce
 - wspiera backtest, walk-forward optimization oraz live/paper runner
@@ -41,7 +42,7 @@ Domyslna siatka WFO:
 - `EMA filter`: `off, on`
 - `EMA length`: domyslnie `10, 20`; w dashboardzie mozna zaznaczyc tez `8, 15`
 - `long zone max`: domyslnie `-10, -20`; w dashboardzie mozna zaznaczyc tez `-30, -40`
-- short nie ma osobnej siatki wejscia; korzysta z punktow przelaczenia longa
+- short nie ma osobnej siatki; jego progi sa lustrzanym odbiciem wybranych progow long
 
 Dashboard pokazuje dodatkowe wskazniki jakosci strategii:
 
