@@ -1,4 +1,4 @@
-﻿"""
+"""
 bee7_main.py
 =============
 Entry point for the first bee7 WaveTrend strategy.

@@ -1,4 +1,4 @@
-﻿"""
+"""
 bee7_live_runner.py
 ====================
 Paper/live runner for the first bee7 WaveTrend strategy.
@@ -25,8 +25,10 @@ from bee7_engine import (
     bar_from_row as _bar_from_row,
     build_position_state,
     compute_trade_close,
+    generate_emergency_exit_signal,
     generate_entry_signal,
     generate_exit_signal,
+    generate_partial_exit_signal,
 )
 from bee7_params import (
     BINANCE_INTERVAL,
@@ -64,6 +66,14 @@ def load_state() -> dict:
             "capital_at_open": None,
             "stop_price": None,
             "entry_atr": None,
+            "remaining_fraction": 1.0,
+            "tp1_taken": False,
+            "tp2_taken": False,
+            "tp1_protection_after_bars": 0,
+            "h1_red_close_count": 0,
+            "h1_green_close_count": 0,
+            "trade_id": 0,
+            "next_trade_id": 1,
             "last_bar_time": None,
             "daily_loss_usd": 0.0,
             "daily_date": None,
@@ -82,6 +92,19 @@ def save_state(state: dict) -> None:
 def log_trade(trade: dict) -> None:
     with open(TRADES_LOG, "a", encoding="utf-8") as f:
         f.write(json.dumps(trade, default=str) + "\n")
+
+
+def holding_hours(entry_time, exit_time) -> float:
+    try:
+        start = datetime.fromisoformat(str(entry_time).replace("Z", "+00:00"))
+        end = datetime.fromisoformat(str(exit_time).replace("Z", "+00:00"))
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        return max(0.0, (end - start).total_seconds() / 3600.0)
+    except Exception:
+        return float("nan")
 
 
 def check_daily_loss(state: dict, capital: float) -> bool:
@@ -124,6 +147,13 @@ def position_from_state(state: dict) -> Optional[PositionState]:
         bars_in_position=int(state.get("bars_in_position", 0)),
         stop_price=float(state["stop_price"]) if state.get("stop_price") is not None else float("nan"),
         entry_atr=float(state["entry_atr"]) if state.get("entry_atr") is not None else float("nan"),
+        remaining_fraction=float(state.get("remaining_fraction", 1.0)),
+        tp1_taken=bool(state.get("tp1_taken", False)),
+        tp2_taken=bool(state.get("tp2_taken", False)),
+        tp1_protection_after_bars=int(state.get("tp1_protection_after_bars", 0)),
+        h1_red_close_count=int(state.get("h1_red_close_count", 0)),
+        h1_green_close_count=int(state.get("h1_green_close_count", 0)),
+        trade_id=int(state.get("trade_id", 0)),
     )
 
 
@@ -136,6 +166,13 @@ def position_to_state(state: dict, pos: Optional[PositionState]) -> None:
         state["capital_at_open"] = None
         state["stop_price"] = None
         state["entry_atr"] = None
+        state["remaining_fraction"] = 1.0
+        state["tp1_taken"] = False
+        state["tp2_taken"] = False
+        state["tp1_protection_after_bars"] = 0
+        state["h1_red_close_count"] = 0
+        state["h1_green_close_count"] = 0
+        state["trade_id"] = 0
     else:
         state["position"] = pos.side
         state["entry_price"] = pos.entry_price
@@ -143,6 +180,13 @@ def position_to_state(state: dict, pos: Optional[PositionState]) -> None:
         state["bars_in_position"] = pos.bars_in_position
         state["stop_price"] = None if np.isnan(pos.stop_price) else pos.stop_price
         state["entry_atr"] = None if np.isnan(pos.entry_atr) else pos.entry_atr
+        state["remaining_fraction"] = pos.remaining_fraction
+        state["tp1_taken"] = pos.tp1_taken
+        state["tp2_taken"] = pos.tp2_taken
+        state["tp1_protection_after_bars"] = pos.tp1_protection_after_bars
+        state["h1_red_close_count"] = pos.h1_red_close_count
+        state["h1_green_close_count"] = pos.h1_green_close_count
+        state["trade_id"] = pos.trade_id
 
 
 def execute_order(
@@ -192,50 +236,101 @@ def process_bar(bar, prev, params: dict, state: dict, mode: str) -> None:
 
     position = position_from_state(state)
 
+    def _close_position_signal(position: PositionState, sig, capital: float, final_close: bool) -> float:
+        raw_exit = sig.exit_price if sig.exit_price is not None else bar.close
+        close_fraction = min(
+            max(float((sig.meta or {}).get("close_fraction", position.remaining_fraction)), 0.0),
+            position.remaining_fraction,
+        )
+        capital_at_open = float(state.get("capital_at_open") or capital)
+        close_notional = capital_at_open * close_fraction
+        exec_price = apply_slippage(raw_exit, position.side, "close", slip_bps, spread_bps)
+        exec_price = execute_order(position.side, "close", exec_price, close_notional, mode, sig.reason)
+
+        result = compute_trade_close(
+            entry_price=position.entry_price,
+            exit_price=exec_price,
+            side=position.side,
+            fee_rate=fee_rate,
+            capital_at_open=close_notional,
+        )
+
+        pnl = result["pnl"]
+        if pnl < 0:
+            state["daily_loss_usd"] = state.get("daily_loss_usd", 0.0) + abs(pnl)
+
+        capital += pnl
+        state["capital"] = capital
+
+        remaining_after = max(0.0, position.remaining_fraction - close_fraction)
+        if sig.action == "close_partial":
+            trade_event = "TP2" if "TP2" in sig.reason else "TP1" if "TP1" in sig.reason else "TP"
+        else:
+            trade_event = "EXIT"
+        trade_id = int(position.trade_id or 0)
+        hold_hours = holding_hours(position.entry_time, bar_time_str)
+        trade_log = {
+            "ts": bar_time_str,
+            "side": position.side,
+            "entry_price": position.entry_price,
+            "exit_price": exec_price,
+            "gross_ret": result["gross_ret"],
+            "net_ret": result["net_ret"],
+            "pnl_usd": pnl,
+            "fee_usd": result["fee_usd"],
+            "reason": sig.reason,
+            "capital": capital,
+            "capital_at_open": capital_at_open,
+            "position_notional": close_notional,
+            "close_fraction": close_fraction,
+            "remaining_fraction_after": remaining_after,
+            "holding_hours": hold_hours,
+            "time_to_tp1_hours": hold_hours if trade_event == "TP1" else None,
+            "logical_trade_no": trade_id,
+            "trade_event": trade_event,
+            "trade_label": f"{trade_id} {trade_event}".strip(),
+            "mode": mode,
+        }
+        log_trade(trade_log)
+        log.info(
+            f"[CLOSE] {position.side.upper()} | entry={position.entry_price:.2f} "
+            f"exit={exec_price:.2f} | net={result['net_ret'] * 100:.3f}% "
+            f"| pnl={pnl:.2f} USD | {sig.reason}"
+        )
+
+        if final_close or remaining_after <= 1e-9:
+            position_to_state(state, None)
+        else:
+            position.remaining_fraction = remaining_after
+            if "TP2" in sig.reason:
+                position.tp2_taken = True
+            elif "TP1" in sig.reason:
+                position.tp1_taken = True
+                position.tp1_protection_after_bars = position.bars_in_position + 1
+            position_to_state(state, position)
+        return capital
+
+    if position is not None:
+        sig = generate_emergency_exit_signal(bar, params, position)
+        if sig.action != "none":
+            capital = _close_position_signal(position, sig, capital, final_close=True)
+            position = position_from_state(state)
+
+    if position is not None:
+        partial_guard = 0
+        sig = generate_partial_exit_signal(bar, params, position)
+        while sig.action != "none" and position is not None and partial_guard < 3:
+            capital = _close_position_signal(position, sig, capital, final_close=False)
+            position = position_from_state(state)
+            partial_guard += 1
+            if position is None:
+                break
+            sig = generate_partial_exit_signal(bar, params, position)
+
     if position is not None:
         sig = generate_exit_signal(bar, prev, params, position)
         if sig.action != "none":
-            raw_exit = sig.exit_price if sig.exit_price is not None else bar.close
-            exec_price = apply_slippage(raw_exit, position.side, "close", slip_bps, spread_bps)
-            exec_price = execute_order(position.side, "close", exec_price, capital, mode, sig.reason)
-
-            capital_at_open = float(state.get("capital_at_open") or capital)
-            result = compute_trade_close(
-                entry_price=position.entry_price,
-                exit_price=exec_price,
-                side=position.side,
-                fee_rate=fee_rate,
-                capital_at_open=capital_at_open,
-            )
-
-            pnl = result["pnl"]
-            if pnl < 0:
-                state["daily_loss_usd"] = state.get("daily_loss_usd", 0.0) + abs(pnl)
-
-            capital += pnl
-            state["capital"] = capital
-
-            trade_log = {
-                "ts": bar_time_str,
-                "side": position.side,
-                "entry_price": position.entry_price,
-                "exit_price": exec_price,
-                "gross_ret": result["gross_ret"],
-                "net_ret": result["net_ret"],
-                "pnl_usd": pnl,
-                "fee_usd": result["fee_usd"],
-                "reason": sig.reason,
-                "capital": capital,
-                "capital_at_open": capital_at_open,
-                "mode": mode,
-            }
-            log_trade(trade_log)
-            log.info(
-                f"[CLOSE] {position.side.upper()} | entry={position.entry_price:.2f} "
-                f"exit={exec_price:.2f} | net={result['net_ret'] * 100:.3f}% "
-                f"| pnl={pnl:.2f} USD | {sig.reason}"
-            )
-            position_to_state(state, None)
+            capital = _close_position_signal(position, sig, capital, final_close=True)
         else:
             position_to_state(state, position)
 
@@ -259,6 +354,9 @@ def process_bar(bar, prev, params: dict, state: dict, mode: str) -> None:
                 params=params,
                 entry_meta=entry_meta,
             )
+            trade_id = int(state.get("next_trade_id", 1) or 1)
+            new_pos.trade_id = trade_id
+            state["next_trade_id"] = trade_id + 1
             new_pos.entry_meta["entry_stop_price"] = (
                 round(new_pos.stop_price, 4) if not np.isnan(new_pos.stop_price) else np.nan
             )

@@ -1,4 +1,4 @@
-﻿(function () {
+(function () {
   function buildChartState(container) {
     const chart = LightweightCharts.createChart(container, {
       layout: {

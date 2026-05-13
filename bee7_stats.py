@@ -1,4 +1,4 @@
-﻿"""
+"""
 bee7_stats.py
 ==============
 Statystyki, raportowanie, rozbicie fee i PnL.

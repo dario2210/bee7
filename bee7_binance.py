@@ -1,4 +1,4 @@
-﻿"""
+"""
 bee7_binance.py
 ================
 Pobieranie świec OHLCV z publicznego API Binance (spot + futures).
@@ -202,11 +202,16 @@ def update_csv_cache(
 
     Logika:
       - Jeśli CSV nie istnieje → pobiera dane od start_date do teraz
-      - Jeśli CSV istnieje → dociąga tylko nowe świece od ostatniej zapisanej
+      - Jeśli CSV istnieje → uzupełnia starsze świece, jeśli start_date jest
+        wcześniejsze niż początek cache, oraz dociąga nowe świece od końca cache
 
     Zwraca pełny DataFrame gotowy do użycia w strategii (kolumna 'open_time' jako int ms).
     """
     import os
+
+    requested_start_ms = int(pd.Timestamp(start_date, tz="UTC").timestamp() * 1000)
+    bar_ms = interval_to_ms(interval)
+    keep = ["open_time", "open", "high", "low", "close", "volume"]
 
     if os.path.exists(csv_path):
         if verbose:
@@ -225,38 +230,65 @@ def update_csv_cache(
             if verbose:
                 print("[Cache] Kolumna open_time to string – konwertuję na ms.")
             df_old["open_time"] = (
-                pd.to_datetime(df_old["open_time"], utc=True).view("int64") // 10**6
+                pd.to_datetime(df_old["open_time"], utc=True).astype("int64") // 10**6
             ).astype("int64")
 
+        df_old = (
+            df_old[keep]
+            .drop_duplicates(subset=["open_time"])
+            .sort_values("open_time")
+            .reset_index(drop=True)
+        )
+
+        first_ms = int(df_old["open_time"].iloc[0])
         last_ms = int(df_old["open_time"].iloc[-1])
-        bar_ms  = interval_to_ms(interval)
         next_start_ms = last_ms + bar_ms   # pierwsza brakująca świeca
 
         now_ms = int(pd.Timestamp.now(tz="UTC").timestamp() * 1000)
+        parts = []
 
-        if next_start_ms >= now_ms:
+        if requested_start_ms < first_ms:
+            backfill_end_ms = first_ms - bar_ms
             if verbose:
-                print("[Cache] CSV jest aktualny – brak nowych świec do pobrania.")
+                print(
+                    "[Cache] Uzupełniam starsze świece od "
+                    f"{pd.Timestamp(requested_start_ms, unit='ms', tz='UTC').strftime('%Y-%m-%d %H:%M')} "
+                    "do "
+                    f"{pd.Timestamp(backfill_end_ms, unit='ms', tz='UTC').strftime('%Y-%m-%d %H:%M')}..."
+                )
+            df_backfill = fetch_klines_binance(
+                symbol=symbol,
+                interval=interval,
+                start_time_ms=requested_start_ms,
+                end_time_ms=backfill_end_ms,
+                market=market,
+                verbose=verbose,
+            )
+            if not df_backfill.empty:
+                parts.append(df_backfill[keep])
+
+        if next_start_ms < now_ms:
+            if verbose:
+                print(f"[Cache] Dociągam nowe świece od {pd.Timestamp(next_start_ms, unit='ms', tz='UTC').strftime('%Y-%m-%d %H:%M')}...")
+
+            df_new = fetch_klines_binance(
+                symbol       = symbol,
+                interval     = interval,
+                start_time_ms= next_start_ms,
+                market       = market,
+                verbose      = verbose,
+            )
+            if not df_new.empty:
+                parts.append(df_new[keep])
+        elif verbose:
+            print("[Cache] CSV jest aktualny – brak nowych świec do pobrania.")
+
+        if not parts:
+            if verbose:
+                print("[Cache] Brak brakujących świec do dopisania.")
             return df_old[["open_time", "open", "high", "low", "close", "volume"]].copy()
 
-        if verbose:
-            print(f"[Cache] Dociągam nowe świece od {pd.Timestamp(next_start_ms, unit='ms', tz='UTC').strftime('%Y-%m-%d %H:%M')}...")
-
-        df_new = fetch_klines_binance(
-            symbol       = symbol,
-            interval     = interval,
-            start_time_ms= next_start_ms,
-            market       = market,
-            verbose      = verbose,
-        )
-
-        if df_new.empty:
-            if verbose:
-                print("[Cache] Brak nowych danych.")
-            return df_old[["open_time", "open", "high", "low", "close", "volume"]].copy()
-
-        keep = ["open_time", "open", "high", "low", "close", "volume"]
-        df_all = pd.concat([df_old[keep], df_new[keep]], ignore_index=True)
+        df_all = pd.concat([*parts, df_old[keep]], ignore_index=True)
         df_all = (
             df_all
             .drop_duplicates(subset=["open_time"])
@@ -267,11 +299,10 @@ def update_csv_cache(
     else:
         if verbose:
             print(f"[Cache] CSV nie istnieje – pobieram od {start_date}.")
-        start_ms = int(pd.Timestamp(start_date, tz="UTC").timestamp() * 1000)
         df_all = fetch_klines_binance(
             symbol        = symbol,
             interval      = interval,
-            start_time_ms = start_ms,
+            start_time_ms = requested_start_ms,
             market        = market,
             verbose       = verbose,
         )

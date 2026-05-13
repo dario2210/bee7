@@ -1,4 +1,4 @@
-﻿"""
+"""
 bee7_wfo_scoring.py
 ====================
 Funkcje scoringu dla WFO (punkt 5 z briefu).

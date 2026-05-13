@@ -1,8 +1,8 @@
-﻿"""
-bee7_dashboard.py  –  Bee7 WaveTrend Dashboard  http://IP:8067
+"""
+bee7_dashboard.py  -  Bee7 WaveTrend Dashboard  http://IP:8067
 """
 from __future__ import annotations
-import argparse, json, os, threading
+import argparse, datetime as _dt, io, json, os, threading
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -23,11 +23,20 @@ from bee7_params import (
     WT_USE_HTF_TREND_FILTER_GRID,
     WT_EMA_FILTER_LEN_OPTIONS,
     WT_LONG_ENTRY_MAX_ABOVE_ZERO_GRID, WT_LONG_ENTRY_MAX_ABOVE_ZERO_OPTIONS,
+    WT_LONG_CLOSE_MIN_LEVEL_GRID, WT_LONG_CLOSE_MIN_LEVEL_OPTIONS,
     WT_SHORT_ENTRY_MIN_BELOW_ZERO_GRID, WT_SHORT_ENTRY_MIN_BELOW_ZERO_OPTIONS,
     WT_H4_LONG_FILTER_MAX_GRID, WT_H4_LONG_FILTER_MAX_OPTIONS,
+    WT_H4_LONG_CLOSE_MIN_GRID, WT_H4_LONG_CLOSE_MIN_OPTIONS,
     WT_H4_SHORT_FILTER_MIN_GRID, WT_H4_SHORT_FILTER_MIN_OPTIONS,
+    WT_LONG_EMERGENCY_SL_CAPITAL_PCT_GRID, WT_LONG_EMERGENCY_SL_CAPITAL_PCT_OPTIONS,
 )
-from bee7_data     import load_klines, prepare_indicators
+from bee7_data     import (
+    htf_wt1_column,
+    htf_wt2_column,
+    load_klines,
+    prepare_indicators,
+    wt_columns,
+)
 from bee7_strategy import Bee7Strategy
 from bee7_wfo      import get_latest_best_params, walk_forward_optimization
 from bee7_stats    import (
@@ -60,6 +69,13 @@ _state  = {"running": False, "stop": False, "status": "", "progress": "",
            "result": None, "result_version": 0}
 _chart_df_cache: dict = {}   # (symbol, tf) → df z wskaźnikami
 _APP_DIR = Path(__file__).resolve().parent
+_SAVED_RUNS_DIR = _APP_DIR / "results" / "saved_runs"
+CHART_VIEW_OPTIONS = [
+    {"label": "Standard", "value": "standard"},
+    {"label": "Diagnostyka sygnałów", "value": "diagnostic"},
+    {"label": "Tylko transakcje", "value": "trades"},
+]
+CHART_VIEW_VALUES = {item["value"] for item in CHART_VIEW_OPTIONS}
 
 def gs():
     with _lock: return dict(_state)
@@ -69,6 +85,27 @@ def ss(**kw):
         if "result" in kw:
             _state["result_version"] += 1
         _state.update(kw)
+
+def _fmt_duration(seconds: float | int | None) -> str:
+    try:
+        seconds = int(max(0, float(seconds)))
+    except Exception:
+        return "n/d"
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+def _elapsed_eta(start_ts: float, done_units: int, total_units: int) -> tuple[str, str]:
+    elapsed = max(0.0, _time.time() - float(start_ts or _time.time()))
+    if done_units <= 0 or total_units <= 0:
+        return _fmt_duration(elapsed), "liczę..."
+    per_unit = elapsed / max(done_units, 1)
+    remaining = max(0, total_units - done_units) * per_unit
+    return _fmt_duration(elapsed), _fmt_duration(remaining)
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 lbl = lambda t: html.Div(t, style={
@@ -111,6 +148,109 @@ def btn(id_, label, color=C["blue"], text="#fff"):
         "cursor":"pointer","marginBottom":"8px"})
 
 
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if isinstance(value, (_dt.datetime, _dt.date, _dt.time)):
+        return value.isoformat()
+    if isinstance(value, np.ndarray):
+        return [_json_safe(v) for v in value.tolist()]
+    if isinstance(value, np.generic):
+        return _json_safe(value.item())
+    if isinstance(value, float):
+        return value if np.isfinite(value) else None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    return value
+
+
+def _safe_slug(value, fallback="run") -> str:
+    text = str(value or fallback).strip()
+    cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in text)
+    cleaned = "-".join(part for part in cleaned.split("-") if part)
+    return cleaned or fallback
+
+
+def _saved_result_filename(result_data: dict) -> str:
+    stats = result_data.get("stats", {}) if isinstance(result_data, dict) else {}
+    mode = _safe_slug(str(result_data.get("mode", "run")).lower() if isinstance(result_data, dict) else "run")
+    symbol = _safe_slug(str(result_data.get("symbol", "asset")).upper() if isinstance(result_data, dict) else "asset")
+    tf = _safe_slug(str(result_data.get("tf", "tf")).lower() if isinstance(result_data, dict) else "tf")
+    ret = float(stats.get("net_return_pct", 0.0) or 0.0)
+    ret_token = ("p" if ret >= 0 else "m") + f"{abs(ret):.2f}".replace(".", "p")
+    n_trades = int(float(stats.get("n_trades", len(result_data.get("trades", []))) or 0))
+    stamp = pd.Timestamp.utcnow().strftime("%Y%m%d_%H%M%S")
+    return f"bee7_{stamp}_{mode}_{symbol}_{tf}_{ret_token}pct_tr{n_trades}.json"
+
+
+def _saved_result_path(filename: str) -> Path:
+    safe_name = Path(str(filename or "")).name
+    if not safe_name.endswith(".json"):
+        raise ValueError("Nieprawidłowy plik wyniku.")
+    path = (_SAVED_RUNS_DIR / safe_name).resolve()
+    root = _SAVED_RUNS_DIR.resolve()
+    if root not in path.parents:
+        raise ValueError("Plik musi znajdować się w katalogu zapisanych wyników.")
+    return path
+
+
+def _save_result_file(result_data: dict) -> str:
+    if not result_data:
+        raise ValueError("Brak wyniku do zapisu.")
+    _SAVED_RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    filename = _saved_result_filename(result_data)
+    payload = {
+        "schema": "bee7_dashboard_result_v1",
+        "saved_at": pd.Timestamp.utcnow().isoformat(),
+        "meta": {
+            "mode": result_data.get("mode"),
+            "symbol": result_data.get("symbol"),
+            "tf": result_data.get("tf"),
+            "capital": result_data.get("capital"),
+            "stats": _json_safe(result_data.get("stats", {})),
+        },
+        "result": _json_safe(result_data),
+    }
+    path = _saved_result_path(filename)
+    with path.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2, allow_nan=False)
+    return filename
+
+
+def _load_result_file(filename: str) -> dict:
+    path = _saved_result_path(filename)
+    with path.open("r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+    result = payload.get("result", payload) if isinstance(payload, dict) else {}
+    if not isinstance(result, dict):
+        raise ValueError("Plik nie zawiera wyniku dashboardu.")
+    result["_loaded_from_file"] = path.name
+    return result
+
+
+def _saved_result_options(limit: int = 100) -> list[dict[str, str]]:
+    if not _SAVED_RUNS_DIR.exists():
+        return []
+    files = sorted(
+        _SAVED_RUNS_DIR.glob("*.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )[:limit]
+    options = []
+    for path in files:
+        mtime = pd.Timestamp(path.stat().st_mtime, unit="s", tz="UTC").tz_convert("Europe/Warsaw")
+        label = f"{mtime.strftime('%Y-%m-%d %H:%M')} | {path.stem}"
+        options.append({"label": label, "value": path.name})
+    return options
+
+
 def _parse_bool_value(value, default=False) -> bool:
     if value is None or value == "":
         return default
@@ -132,12 +272,15 @@ def _clean_selected_values(values, fallback, caster):
 
 
 def _direction_flags(direction) -> tuple[str, bool, bool]:
-    choice = str(direction or DEFAULT_PARAMS.get("trade_direction", "both")).strip().lower()
-    if choice == "long":
-        return "long", True, False
-    if choice == "short":
-        return "short", False, True
-    return "both", True, True
+    # BEE7 currently tests only the long side. Short signals are ignored by design.
+    return "long", True, False
+
+
+def _pct_value(value, fallback: float = 0.0) -> float:
+    if value in (None, ""):
+        return float(fallback)
+    pct = float(value)
+    return pct / 100.0 if pct > 1.0 else pct
 
 
 def _strategy_params_from_controls(
@@ -154,22 +297,39 @@ def _strategy_params_from_controls(
     short_zone,
     h4_long_filter,
     h4_short_filter,
+    long_close_level,
+    h4_long_close_level,
+    long_tp1_pct,
+    long_sl_pct,
     fee_rate: float,
     slippage_bps: float,
 ) -> dict:
     params = dict(DEFAULT_PARAMS)
     trade_direction, allow_longs, allow_shorts = _direction_flags(direction)
+    emergency_sl_pct = _pct_value(
+        long_sl_pct,
+        float(DEFAULT_PARAMS.get("wt_long_emergency_sl_capital_pct", 0.0)),
+    )
     params.update(
         {
             "trade_direction": trade_direction,
             "allow_longs": allow_longs,
             "allow_shorts": allow_shorts,
+            "short_trading_enabled": False,
             "wt_channel_len": int(channel_len if channel_len not in (None, "") else DEFAULT_PARAMS["wt_channel_len"]),
             "wt_avg_len": int(avg_len if avg_len not in (None, "") else DEFAULT_PARAMS["wt_avg_len"]),
             "wt_signal_len": int(signal_len if signal_len not in (None, "") else DEFAULT_PARAMS["wt_signal_len"]),
             "wt_min_signal_level": 0.0,
-            "wt_long_entry_window_bars": 0,
-            "wt_short_entry_window_bars": 0,
+            "wt_long_entry_window_bars": int(
+                reentry_window
+                if reentry_window not in (None, "")
+                else DEFAULT_PARAMS["wt_long_entry_window_bars"]
+            ),
+            "wt_short_entry_window_bars": int(
+                reentry_window
+                if reentry_window not in (None, "")
+                else DEFAULT_PARAMS["wt_long_entry_window_bars"]
+            ),
             "wt_long_require_ema20_reclaim": False,
             "wt_short_require_ema20_reject": False,
             "wt_long_require_htf_trend": False,
@@ -178,16 +338,45 @@ def _strategy_params_from_controls(
             "wt_long_entry_max_above_zero": float(
                 long_zone if long_zone not in (None, "") else DEFAULT_PARAMS["wt_long_entry_max_above_zero"]
             ),
+            "wt_long_close_min_level": float(
+                long_close_level
+                if long_close_level not in (None, "")
+                else DEFAULT_PARAMS["wt_long_close_min_level"]
+            ),
+            "wt_long_exit_min_level": float(
+                long_close_level
+                if long_close_level not in (None, "")
+                else DEFAULT_PARAMS["wt_long_close_min_level"]
+            ),
             "wt_short_entry_min_below_zero": float(
                 short_zone if short_zone not in (None, "") else DEFAULT_PARAMS["wt_short_entry_min_below_zero"]
             ),
             "wt_h4_long_filter_max": float(
                 h4_long_filter if h4_long_filter not in (None, "") else DEFAULT_PARAMS["wt_h4_long_filter_max"]
             ),
+            "wt_h4_long_close_min": float(
+                h4_long_close_level
+                if h4_long_close_level not in (None, "")
+                else DEFAULT_PARAMS["wt_h4_long_close_min"]
+            ),
             "wt_h4_short_filter_min": float(
                 h4_short_filter if h4_short_filter not in (None, "") else DEFAULT_PARAMS["wt_h4_short_filter_min"]
             ),
-            "wt_h4_invalidation_exit_enabled": True,
+            "wt_long_tp1_enabled": True,
+            "wt_long_tp1_pct": float(
+                (long_tp1_pct if long_tp1_pct not in (None, "") else DEFAULT_PARAMS.get("wt_long_tp1_pct", 0.01) * 100.0)
+            ) / 100.0,
+            "wt_long_tp1_fraction": float(DEFAULT_PARAMS.get("wt_long_tp1_fraction", 1.0 / 3.0)),
+            "wt_long_tp2_enabled": True,
+            "wt_long_tp2_pct": float(DEFAULT_PARAMS.get("wt_long_tp2_pct", 0.02)),
+            "wt_long_tp2_fraction": float(DEFAULT_PARAMS.get("wt_long_tp2_fraction", 1.0 / 3.0)),
+            "wt_long_emergency_sl_enabled": emergency_sl_pct > 0.0,
+            "wt_long_emergency_sl_capital_pct": emergency_sl_pct,
+            "wt_short_tp1_enabled": True,
+            "wt_short_tp1_pct": float(
+                (long_tp1_pct if long_tp1_pct not in (None, "") else DEFAULT_PARAMS.get("wt_short_tp1_pct", 0.01) * 100.0)
+            ) / 100.0,
+            "wt_short_tp1_fraction": float(DEFAULT_PARAMS.get("wt_short_tp1_fraction", 1.0 / 3.0)),
             "atr_stop_enabled": False,
             "breakeven_trigger_atr": 0.0,
             "trailing_trigger_atr": 0.0,
@@ -213,6 +402,9 @@ def _grid_overrides_from_controls(
     short_zone_grid,
     h4_long_filter_grid,
     h4_short_filter_grid,
+    long_close_level_grid,
+    h4_long_close_level_grid,
+    long_sl_pct_grid,
 ) -> dict:
     return {
         "wt_channel_len": _clean_selected_values(channel_grid, WT_CHANNEL_LEN_GRID, int),
@@ -228,21 +420,28 @@ def _grid_overrides_from_controls(
             WT_LONG_ENTRY_MAX_ABOVE_ZERO_GRID,
             float,
         ),
-        "wt_short_entry_min_below_zero": _clean_selected_values(
-            short_zone_grid,
-            WT_SHORT_ENTRY_MIN_BELOW_ZERO_GRID,
+        "wt_long_close_min_level": _clean_selected_values(
+            long_close_level_grid,
+            WT_LONG_CLOSE_MIN_LEVEL_GRID,
             float,
         ),
+        "wt_short_entry_min_below_zero": [float(DEFAULT_PARAMS["wt_short_entry_min_below_zero"])],
         "wt_h4_long_filter_max": _clean_selected_values(
             h4_long_filter_grid,
             WT_H4_LONG_FILTER_MAX_GRID,
             float,
         ),
-        "wt_h4_short_filter_min": _clean_selected_values(
-            h4_short_filter_grid,
-            WT_H4_SHORT_FILTER_MIN_GRID,
+        "wt_h4_long_close_min": _clean_selected_values(
+            h4_long_close_level_grid,
+            WT_H4_LONG_CLOSE_MIN_GRID,
             float,
         ),
+        "wt_long_emergency_sl_capital_pct": _clean_selected_values(
+            long_sl_pct_grid,
+            WT_LONG_EMERGENCY_SL_CAPITAL_PCT_GRID,
+            float,
+        ),
+        "wt_h4_short_filter_min": [float(DEFAULT_PARAMS["wt_h4_short_filter_min"])],
     }
 
 
@@ -255,37 +454,43 @@ def _grid_combo_count(grid_overrides: dict) -> int:
 
 PARAM_SUMMARY_ORDER = [
     "trade_direction",
-    "wt_channel_len",
-    "wt_avg_len",
-    "wt_signal_len",
+    "wt_long_entry_window_bars",
     "wt_long_entry_max_above_zero",
-    "wt_short_entry_min_below_zero",
+    "wt_long_close_min_level",
     "wt_h4_long_filter_max",
-    "wt_h4_short_filter_min",
-    "wt_h4_invalidation_exit_enabled",
+    "wt_h4_long_close_min",
+    "wt_long_emergency_sl_capital_pct",
+    "wt_long_tp1_pct",
+    "wt_long_tp1_fraction",
+    "wt_long_tp2_pct",
+    "wt_long_tp2_fraction",
     "fee_rate",
     "slippage_bps",
 ]
 
 PARAM_SUMMARY_LABELS = {
     "trade_direction": "Direction",
-    "wt_channel_len": "Channel",
-    "wt_avg_len": "Average",
-    "wt_signal_len": "Signal",
-    "wt_long_entry_max_above_zero": "Long zone H1",
-    "wt_short_entry_min_below_zero": "Short zone H1",
-    "wt_h4_long_filter_max": "Long filter H4",
-    "wt_h4_short_filter_min": "Short filter H4",
-    "wt_h4_invalidation_exit_enabled": "H4 emergency exit",
+    "wt_long_entry_window_bars": "Entry window H1",
+    "wt_long_entry_max_above_zero": "Long open level H1",
+    "wt_long_close_min_level": "Long close level H1",
+    "wt_h4_long_filter_max": "Long open level H4",
+    "wt_h4_long_close_min": "Long close level H4",
+    "wt_long_emergency_sl_capital_pct": "Stop loss",
+    "wt_long_tp1_pct": "Long TP1",
+    "wt_long_tp1_fraction": "Long TP1 fraction",
+    "wt_long_tp2_pct": "Long TP2",
+    "wt_long_tp2_fraction": "Long TP2 fraction",
     "fee_rate": "Fee rate",
     "slippage_bps": "Slippage bps",
 }
 
 
-def _format_param_value(value):
+def _format_param_value(value, key: str | None = None):
     if isinstance(value, bool):
         return "On" if value else "Off"
     if isinstance(value, float):
+        if key and key.endswith("_pct"):
+            return f"{value * 100.0:.2f}%"
         return round(value, 4)
     return value
 
@@ -301,7 +506,7 @@ def _params_table_frame(params: dict | None) -> pd.DataFrame:
         rows.append(
             {
                 "parametr": PARAM_SUMMARY_LABELS.get(key, key),
-                "wartość": _format_param_value(params[key]),
+                "wartość": _format_param_value(params[key], key),
             }
         )
 
@@ -355,15 +560,15 @@ def hero_banner() -> html.Div:
             html.Div("TradingView open source", className="hero-eyebrow"),
             html.H2("Bee7 WaveTrend console"),
             html.P(
-                "Bee7 zachowuje dashboard bee1, ale w galezi BEE7_2 pracuje jako "
-                "WaveTrend H1 z natychmiastowym wejsciem na kropce oraz filtrem WT liczonym z H4."
+                "Bee7 zachowuje dashboard bee1, ale testuje bardziej elastyczne wejscia H1 "
+                "oraz miekki filtr H4 oparty na ostatniej zamknietej swiecy H4."
             ),
         ], className="hero-copy"),
         html.Div([
             html.Div("Note", className="hero-note-title"),
             html.P(
-                "Long pojawia sie na zielonej kropce H1 przy glebokim WT oraz tylko wtedy, gdy linie WT z H4 sa nisko i zblizaja sie do siebie. "
-                "Short dziala lustrzanie, a wyjscie nastepuje dopiero na przeciwnym setupie."
+                "Long moze pojawic sie na zielonej kropce H1 albo kilka swiec po niej, gdy H1 jest w strefie open. "
+                "H4 filtruje kontekst przez poziom open i poprawiajaca sie delte, a wyjscie longa wymaga close level H1/H4 oraz slabniecia H1."
             ),
         ], className="hero-note"),
     ], className="hero-panel")
@@ -407,16 +612,14 @@ def fig_wfo(wd):
 def fig_pdist(wd):
     if wd is None or wd.empty: return go.Figure(layout=PT)
     specs = [
-        ("best_wt_channel_len", "Channel", C["blue"]),
-        ("best_wt_avg_len", "Average", C["green"]),
-        ("best_wt_signal_len", "Signal", C["amber"]),
-        ("best_wt_long_entry_max_above_zero", "Long zone H1", C["green"]),
-        ("best_wt_short_entry_min_below_zero", "Short zone H1", C["red"]),
-        ("best_wt_h4_long_filter_max", "Long filter H4", C["purple"]),
-        ("best_wt_h4_short_filter_min", "Short filter H4", C["coral"]),
+        ("best_wt_long_entry_max_above_zero", "Long open level H1", C["green"]),
+        ("best_wt_long_close_min_level", "Long close level H1", C["amber"]),
+        ("best_wt_h4_long_filter_max", "Long open level H4", C["purple"]),
+        ("best_wt_h4_long_close_min", "Long close level H4", C["blue"]),
     ]
+    rows = max(1, (len(specs) + 1) // 2)
     fig = make_subplots(
-        rows=4,
+        rows=rows,
         cols=2,
         subplot_titles=[title for _, title, _ in specs],
         vertical_spacing=0.12,
@@ -434,7 +637,7 @@ def fig_pdist(wd):
             row=row,
             col=col_idx,
         )
-    fig.update_layout(**PT, height=920)
+    fig.update_layout(**PT, height=max(520, rows * 260))
     return fig
 
 def fig_fee(fd):
@@ -453,6 +656,410 @@ def fig_fee(fd):
     fig.update_yaxes(title_text="Net PnL",secondary_y=False,gridcolor=C["border"])
     fig.update_yaxes(title_text="Fee USD",secondary_y=True,gridcolor="rgba(0,0,0,0)")
     return fig
+
+
+def _direction_stats_df(trades_df: pd.DataFrame) -> pd.DataFrame:
+    if trades_df is None or trades_df.empty or "side" not in trades_df.columns or "pnl" not in trades_df.columns:
+        return pd.DataFrame(
+            [
+                {"side": side, "trades": 0, "wins": 0, "losses": 0, "win_pnl_usd": 0.0, "loss_pnl_usd": 0.0, "net_pnl_usd": 0.0}
+                for side in ("long", "short")
+            ]
+        )
+
+    df = trades_df.copy()
+    df["side"] = df["side"].astype(str).str.lower()
+    df["pnl"] = pd.to_numeric(df["pnl"], errors="coerce").fillna(0.0)
+    records = []
+    for side in ("long", "short"):
+        sub = df[df["side"] == side]
+        wins = sub[sub["pnl"] > 0]
+        losses = sub[sub["pnl"] <= 0]
+        records.append(
+            {
+                "side": side,
+                "trades": int(len(sub)),
+                "wins": int(len(wins)),
+                "losses": int(len(losses)),
+                "win_pnl_usd": float(wins["pnl"].sum()),
+                "loss_pnl_usd": float(losses["pnl"].sum()),
+                "net_pnl_usd": float(sub["pnl"].sum()),
+            }
+        )
+    return pd.DataFrame(records)
+
+
+def _direction_stats_from_result(result_data: dict | None) -> pd.DataFrame:
+    if not result_data:
+        return _direction_stats_df(pd.DataFrame())
+    return _direction_stats_df(pd.DataFrame(result_data.get("trades", [])))
+
+
+def _direction_row(direction_df: pd.DataFrame, side: str) -> dict:
+    if direction_df is None or direction_df.empty:
+        return {"side": side, "trades": 0, "wins": 0, "losses": 0, "win_pnl_usd": 0.0, "loss_pnl_usd": 0.0, "net_pnl_usd": 0.0}
+    rows = direction_df[direction_df["side"] == side]
+    if rows.empty:
+        return {"side": side, "trades": 0, "wins": 0, "losses": 0, "win_pnl_usd": 0.0, "loss_pnl_usd": 0.0, "net_pnl_usd": 0.0}
+    return rows.iloc[0].to_dict()
+
+
+def _money(value) -> str:
+    value = float(value or 0.0)
+    sign = "+" if value > 0 else ""
+    return f"${sign}{value:,.0f}"
+
+
+def fig_report_price_wt(result_data: dict) -> go.Figure:
+    symbol = str(result_data.get("symbol", ""))
+    tf = str(result_data.get("tf", ""))
+    params = result_data.get("best_params") or result_data.get("params_used") or DEFAULT_PARAMS
+    trades_df = pd.DataFrame(result_data.get("trades", []))
+    windows_df = pd.DataFrame(result_data.get("windows_df", []))
+    payload = lightweight_chart_payload(symbol, tf, trades_df, windows_df=windows_df, params=params)
+
+    candles = pd.DataFrame(payload.get("candles", []))
+    if candles.empty:
+        return go.Figure(layout=PT)
+    candles["dt"] = pd.to_datetime(candles["time"], unit="s", utc=True, errors="coerce")
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.5, 0.5], vertical_spacing=0.04)
+    fig.add_trace(
+        go.Candlestick(
+            x=candles["dt"],
+            open=candles["open"],
+            high=candles["high"],
+            low=candles["low"],
+            close=candles["close"],
+            name="OHLC",
+            increasing={"line": {"color": C["green"], "width": 1}, "fillcolor": C["green"]},
+            decreasing={"line": {"color": C["coral"], "width": 1}, "fillcolor": C["coral"]},
+        ),
+        row=1,
+        col=1,
+    )
+
+    for line in payload.get("lines", []):
+        data = pd.DataFrame(line.get("data", []))
+        if data.empty:
+            continue
+        data["dt"] = pd.to_datetime(data["time"], unit="s", utc=True, errors="coerce")
+        fig.add_trace(
+            go.Scatter(
+                x=data["dt"],
+                y=data["value"],
+                mode="lines",
+                name=line.get("label", line.get("id")),
+                line={"color": line.get("color"), "width": line.get("lineWidth", 2)},
+            ),
+            row=1,
+            col=1,
+        )
+
+    if not trades_df.empty:
+        tdf = _normalize_chart_trades(trades_df)
+        for side, color, symbol_marker, name in [
+            ("long", C["green"], "triangle-up", "Long IN"),
+            ("short", C["red"], "triangle-down", "Short IN"),
+        ]:
+            sub = tdf[tdf["side"] == side] if "side" in tdf.columns else pd.DataFrame()
+            if sub.empty:
+                continue
+            fig.add_trace(
+                go.Scatter(
+                    x=sub["entry_time"],
+                    y=sub["entry_price"],
+                    mode="markers",
+                    name=name,
+                    marker={"symbol": symbol_marker, "size": 8, "color": color, "line": {"width": 0.5, "color": "#ffffff"}},
+                ),
+                row=1,
+                col=1,
+            )
+
+    signal_lookup = {}
+    for line in payload.get("signalLines", []):
+        data = pd.DataFrame(line.get("data", []))
+        if data.empty:
+            continue
+        data["dt"] = pd.to_datetime(data["time"], unit="s", utc=True, errors="coerce")
+        dash_style = "dot" if int(line.get("lineStyle", 0) or 0) == 2 else "solid"
+        fig.add_trace(
+            go.Scatter(
+                x=data["dt"],
+                y=data["value"],
+                mode="lines",
+                name=line.get("label", line.get("id")),
+                line={"color": line.get("color"), "width": line.get("lineWidth", 2), "dash": dash_style},
+            ),
+            row=2,
+            col=1,
+        )
+        signal_lookup[line.get("id")] = dict(zip(data["time"], data["value"]))
+
+    marker_groups: dict[str, list[dict[str, object]]] = {}
+    for marker in payload.get("signalMarkers", []):
+        sid = marker.get("seriesId")
+        value = signal_lookup.get(sid, {}).get(marker.get("time"))
+        if value is None:
+            continue
+        label = str(marker.get("text", "cross"))
+        marker_groups.setdefault(label, []).append(
+            {
+                "time": pd.to_datetime(marker.get("time"), unit="s", utc=True, errors="coerce"),
+                "value": value,
+                "color": marker.get("color", C["blue"]),
+            }
+        )
+    for label, records in marker_groups.items():
+        marker_df = pd.DataFrame(records)
+        fig.add_trace(
+            go.Scatter(
+                x=marker_df["time"],
+                y=marker_df["value"],
+                mode="markers",
+                name=label,
+                marker={"size": 6, "color": marker_df["color"], "symbol": "circle"},
+            ),
+            row=2,
+            col=1,
+        )
+
+    for yv, color in [
+        (TMA_LOW_MIN, "rgba(34, 211, 170, 0.35)"),
+        (TMA_LOW_MAX, "rgba(34, 211, 170, 0.35)"),
+        (0.0, "rgba(149, 166, 188, 0.40)"),
+        (TMA_HIGH_MIN, "rgba(255, 93, 115, 0.35)"),
+        (TMA_HIGH_MAX, "rgba(255, 93, 115, 0.35)"),
+    ]:
+        fig.add_hline(y=yv, line_dash="dot", line_color=color, line_width=1, row=2, col=1)
+
+    fig.update_layout(
+        **PT,
+        height=720,
+        title=f"{symbol.upper()} {tf} | Cena + WaveTrend H1/H4",
+        showlegend=True,
+        xaxis_rangeslider_visible=False,
+        legend={"orientation": "h", "y": -0.12, "x": 0, "font": {"size": 9, "color": C["text"]}},
+    )
+    fig.update_yaxes(title_text="Cena", row=1, col=1, gridcolor=C["border"])
+    fig.update_yaxes(title_text="WT", row=2, col=1, gridcolor=C["border"])
+    return fig
+
+
+def _report_filename(result_data: dict) -> str:
+    mode = _safe_slug(str(result_data.get("mode", "run")).lower())
+    symbol = _safe_slug(str(result_data.get("symbol", "asset")).upper())
+    tf = _safe_slug(str(result_data.get("tf", "tf")).lower())
+    stamp = pd.Timestamp.utcnow().strftime("%Y%m%d_%H%M%S")
+    return f"bee7_{mode}_{symbol}_{tf}_report_{stamp}.pdf"
+
+
+def _report_value(value, decimals: int = 2) -> str:
+    if value is None:
+        return "n/d"
+    try:
+        if pd.isna(value):
+            return "n/d"
+    except Exception:
+        pass
+    if isinstance(value, (bool, np.bool_)):
+        return "true" if bool(value) else "false"
+    if isinstance(value, (int, np.integer)):
+        return f"{int(value):,}"
+    if isinstance(value, (float, np.floating)):
+        return f"{float(value):,.{decimals}f}"
+    return str(value)
+
+
+def _report_summary_rows(result_data: dict) -> list[list[str]]:
+    stats = result_data.get("stats", {})
+    capital = result_data.get("capital", INITIAL_CAPITAL)
+    consistency = _report_value(stats.get("consistency_pct"), 0)
+    consistency = f"{consistency}%" if consistency != "n/d" else consistency
+    return [
+        ["Tryb", str(result_data.get("mode", "n/d")).upper()],
+        ["Symbol / TF", f"{str(result_data.get('symbol', '')).upper()} {result_data.get('tf', '')}"],
+        ["Kapital startowy", _money(capital)],
+        ["Kapital koncowy", _money(stats.get("final_capital", capital))],
+        ["Net zwrot", f"{float(stats.get('net_return_pct', 0.0) or 0.0):+.2f}%"],
+        ["Net PnL", _money(stats.get("net_profit_usd", 0.0))],
+        ["Max DD", f"{float(stats.get('max_drawdown_pct', 0.0) or 0.0):.2f}%"],
+        ["CAGR", f"{float(stats.get('cagr_pct', 0.0) or 0.0):.2f}%"],
+        ["Transakcje", _report_value(stats.get("n_trades", 0), 0)],
+        ["Winrate", f"{float(stats.get('winrate_pct', 0.0) or 0.0):.2f}%"],
+        ["Profit Factor", _report_value(stats.get("profit_factor"))],
+        ["Expectancy / trade", _money(stats.get("expectancy_usd", 0.0))],
+        ["Return / Drawdown", _report_value(stats.get("return_drawdown_ratio"))],
+        ["Sharpe / Sortino", f"{_report_value(stats.get('sharpe_ratio'))} / {_report_value(stats.get('sortino_ratio'))}"],
+        ["R:R avg", _report_value(stats.get("risk_reward_ratio"))],
+        ["Consistency / Stability", f"{consistency} / {_report_value(stats.get('stability_score'))}"],
+        ["Oplaty", f"{_money(stats.get('fee_total_usd', 0.0))} ({_report_value(stats.get('fee_total_pct', 0.0))}%)"],
+    ]
+
+
+def _df_for_report_table(df: pd.DataFrame, max_rows: int = 80) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy().head(max_rows)
+    for col in out.columns:
+        if pd.api.types.is_datetime64_any_dtype(out[col]):
+            out[col] = pd.to_datetime(out[col], errors="coerce").dt.strftime("%Y-%m-%d %H:%M")
+        elif pd.api.types.is_numeric_dtype(out[col]):
+            out[col] = out[col].map(lambda v: "" if pd.isna(v) else round(float(v), 4))
+    return out.fillna("")
+
+
+def _table_flowables(title: str, df: pd.DataFrame, styles, table_style, max_cols: int = 7, max_rows: int = 80) -> list:
+    from reportlab.platypus import Paragraph, Spacer, Table
+
+    if df is None or df.empty:
+        return [Paragraph(title, styles["Heading2"]), Paragraph("Brak danych.", styles["Muted"]), Spacer(1, 8)]
+
+    df2 = _df_for_report_table(df, max_rows=max_rows)
+    flowables = [Paragraph(title, styles["Heading2"])]
+    columns = list(df2.columns)
+    for start in range(0, len(columns), max_cols):
+        chunk_cols = columns[start:start + max_cols]
+        data = [chunk_cols] + df2[chunk_cols].astype(str).values.tolist()
+        flowables.append(Table(data, repeatRows=1, style=table_style, hAlign="LEFT"))
+        flowables.append(Spacer(1, 8))
+    if len(df) > max_rows:
+        flowables.append(Paragraph(f"Pokazano pierwsze {max_rows} z {len(df)} wierszy.", styles["Muted"]))
+        flowables.append(Spacer(1, 8))
+    return flowables
+
+
+def _params_df(params: dict | None) -> pd.DataFrame:
+    if not params:
+        return pd.DataFrame()
+    return pd.DataFrame([{"parametr": key, "wartosc": _report_value(value)} for key, value in sorted(params.items())])
+
+
+def _figure_flowable(title: str, fig: go.Figure, styles, width: int = 1120, height: int = 620):
+    import plotly.io as pio
+    from reportlab.platypus import Image, Paragraph, Spacer
+
+    fig = go.Figure(fig)
+    fig.update_layout(width=width, height=height)
+    image = pio.to_image(fig, format="png", width=width, height=height, scale=1.4)
+    stream = io.BytesIO(image)
+    return [
+        Paragraph(title, styles["Heading2"]),
+        Image(stream, width=740, height=740 * height / width),
+        Spacer(1, 12),
+    ]
+
+
+def _build_report_pdf(result_data: dict) -> bytes:
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import mm
+        from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    except Exception as exc:
+        raise RuntimeError("Brakuje biblioteki reportlab. Po deployu/rebuildzie zaktualizowane requirements ją doinstalują.") from exc
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=landscape(A4),
+        leftMargin=12 * mm,
+        rightMargin=12 * mm,
+        topMargin=10 * mm,
+        bottomMargin=10 * mm,
+    )
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="TitleBee", parent=styles["Title"], fontSize=18, leading=22, textColor=colors.HexColor("#0f172a")))
+    styles.add(ParagraphStyle(name="Muted", parent=styles["BodyText"], fontSize=8, leading=10, textColor=colors.HexColor("#64748b")))
+    styles["Heading2"].fontSize = 11
+    styles["Heading2"].leading = 14
+    styles["Heading2"].textColor = colors.HexColor("#0f172a")
+
+    table_style = TableStyle(
+        [
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e2e8f0")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#0f172a")),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 7),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#cbd5e1")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]
+    )
+
+    stats = result_data.get("stats", {})
+    capital = result_data.get("capital", INITIAL_CAPITAL)
+    equity_df = pd.DataFrame(result_data.get("equity", []))
+    fee_df = pd.DataFrame(result_data.get("fee_df", []))
+    windows_df = pd.DataFrame(result_data.get("windows_df", []))
+    direction_df = _direction_stats_from_result(result_data)
+    side_df = pd.DataFrame(result_data.get("side_bk", []))
+    cross_df = pd.DataFrame(result_data.get("cross_bk", []))
+    yr_df = pd.DataFrame(result_data.get("yr_bk", []))
+    q_df = pd.DataFrame(result_data.get("q_bk", []))
+    params = result_data.get("best_params") or result_data.get("params_used") or {}
+
+    story = [
+        Paragraph("Bee7 - raport wynikow", styles["TitleBee"]),
+        Paragraph(
+            f"Wygenerowano: {pd.Timestamp.utcnow().strftime('%Y-%m-%d %H:%M UTC')} | "
+            f"{str(result_data.get('mode', '')).upper()} {str(result_data.get('symbol', '')).upper()} {result_data.get('tf', '')}",
+            styles["Muted"],
+        ),
+        Spacer(1, 10),
+        Paragraph("Podsumowanie", styles["Heading2"]),
+        Table(_report_summary_rows(result_data), colWidths=[130, 250], style=table_style, hAlign="LEFT"),
+        Spacer(1, 12),
+        Paragraph("Long / Short", styles["Heading2"]),
+        Table(
+            [["side", "trades", "wins", "losses", "win_pnl_usd", "loss_pnl_usd", "net_pnl_usd"]]
+            + _df_for_report_table(direction_df).astype(str).values.tolist(),
+            repeatRows=1,
+            style=table_style,
+            hAlign="LEFT",
+        ),
+        Spacer(1, 12),
+        Paragraph("Parametry", styles["Heading2"]),
+        Table(
+            [["parametr", "wartosc"]] + _params_df(params).astype(str).values.tolist(),
+            repeatRows=1,
+            style=table_style,
+            hAlign="LEFT",
+        ),
+        PageBreak(),
+    ]
+
+    try:
+        story.extend(_figure_flowable("Equity / Drawdown", fig_eq(equity_df, capital), styles, width=1120, height=620))
+        story.extend(_figure_flowable("Cena + WT H1/H4", fig_report_price_wt(result_data), styles, width=1120, height=700))
+        if not fee_df.empty:
+            story.extend(_figure_flowable("Oplaty", fig_fee(fee_df), styles, width=1120, height=420))
+        if not windows_df.empty:
+            story.extend(_figure_flowable("Okna WFO", fig_wfo(windows_df), styles, width=1120, height=420))
+            story.extend(_figure_flowable("Rozkład parametrów WFO", fig_pdist(windows_df), styles, width=1120, height=820))
+    except Exception as exc:
+        raise RuntimeError("Nie udało się wyrenderować wykresów do PDF. Sprawdź, czy zainstalował się pakiet kaleido.") from exc
+
+    story.append(PageBreak())
+    story.extend(_table_flowables("Long vs Short", side_df, styles, table_style))
+    story.extend(_table_flowables("Statystyki long/short - wygrane i przegrane", direction_df, styles, table_style))
+    story.extend(_table_flowables("Bullish vs Bearish H1 cross", cross_df, styles, table_style))
+    story.extend(_table_flowables("Breakdown roczny", yr_df, styles, table_style))
+    story.extend(_table_flowables("Breakdown kwartalny", q_df, styles, table_style))
+    if not fee_df.empty:
+        story.extend(_table_flowables("Oplaty wg okresu", fee_df, styles, table_style))
+    if not windows_df.empty:
+        story.extend(_table_flowables("Okna WFO", windows_df, styles, table_style, max_cols=7, max_rows=60))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
 
 def _trade_detail_panel(trade: dict | None) -> html.Div:
     """Panel ze szczegolami wybranego trade'u."""
@@ -494,7 +1101,8 @@ def _trade_detail_panel(trade: dict | None) -> html.Div:
         ], style={"display": "flex", "gap": "16px", "marginBottom": "6px"})
 
     trade_no = fmt_text(trade.get("trade_no"), "")
-    title = f"Trade #{trade_no}" if trade_no else "Szczegoly trade'u"
+    trade_label = fmt_text(trade.get("trade_label"), "")
+    title = f"Trade #{trade_no} / {trade_label}" if trade_label else (f"Trade #{trade_no}" if trade_no else "Szczegoly trade'u")
     side = fmt_text(trade.get("side"), "").lower()
     pnl = _as_float(trade.get("pnl"), 0.0)
     pnl_clr = C["green"] if pnl >= 0 else C["red"]
@@ -526,9 +1134,11 @@ def _trade_detail_panel(trade: dict | None) -> html.Div:
             row2(
                 "Bary w pozycji",
                 fmt_text(trade.get("exit_bars", trade.get("bars_in_position", "n/d"))),
-                "Fee",
-                f"{fmt_float(trade.get('fee_usd'), '.2f', '0.00')} USD",
+                "Czas do TP1 h",
+                fmt_float(trade.get("time_to_tp1_hours"), ".2f", "n/d"),
             ),
+            row2("Czas w pozycji h", fmt_float(trade.get("holding_hours"), ".2f", "n/d"),
+                 "Fee", f"{fmt_float(trade.get('fee_usd'), '.2f', '0.00')} USD"),
             html.Div(style={"borderTop": f"1px solid {C['border']}", "margin": "8px 0"}),
             html.Div("Snapshot wejscia", style={"fontSize": "10px", "color": C["muted"],
                 "fontWeight": "600", "textTransform": "uppercase", "letterSpacing": "0.05em",
@@ -606,6 +1216,24 @@ def _annotate_trades(trades_df: pd.DataFrame) -> pd.DataFrame:
     tdf = trades_df.copy().reset_index(drop=True)
     if "trade_no" not in tdf.columns:
         tdf["trade_no"] = np.arange(1, len(tdf) + 1)
+    if "logical_trade_no" not in tdf.columns:
+        tdf["logical_trade_no"] = tdf["trade_no"]
+    if "trade_event" not in tdf.columns:
+        reasons = tdf.get("reason", pd.Series([""] * len(tdf), index=tdf.index)).astype(str)
+        tdf["trade_event"] = np.select(
+            [
+                reasons.str.contains("TP2_PARTIAL", case=False, na=False),
+                reasons.str.contains("TP1_PARTIAL", case=False, na=False),
+            ],
+            ["TP2", "TP1"],
+            default="EXIT",
+        )
+    if "trade_label" not in tdf.columns:
+        logical_ids = pd.to_numeric(tdf["logical_trade_no"], errors="coerce").fillna(tdf["trade_no"])
+        tdf["trade_label"] = [
+            f"{int(float(trade_id))} {str(event or 'EXIT').upper()}"
+            for trade_id, event in zip(logical_ids, tdf["trade_event"])
+        ]
 
     numeric_cols = [
         "entry_price", "exit_price", "gross_ret", "fee_ret", "net_ret",
@@ -615,6 +1243,8 @@ def _annotate_trades(trades_df: pd.DataFrame) -> pd.DataFrame:
         "entry_h4_wt1", "entry_h4_wt2", "entry_h4_delta",
         "exit_wt1", "exit_wt2", "exit_delta",
         "exit_signal_level", "exit_h4_wt1", "exit_h4_wt2", "exit_h4_delta",
+        "holding_hours", "time_to_tp1_hours",
+        "close_fraction", "remaining_fraction_after", "position_notional", "logical_trade_no",
     ]
     for col in numeric_cols:
         if col in tdf.columns:
@@ -642,7 +1272,10 @@ def _trade_table_frame(trades_df: pd.DataFrame) -> pd.DataFrame:
     cols = [
         c for c in [
             "trade_no", "side", "entry_time", "exit_time", "entry_price",
-            "exit_price", "gross_ret", "fee_ret", "net_ret", "pnl", "fee_usd", "reason",
+            "exit_price", "logical_trade_no", "trade_event", "trade_label",
+            "holding_hours", "time_to_tp1_hours",
+            "close_fraction", "remaining_fraction_after",
+            "gross_ret", "fee_ret", "net_ret", "pnl", "fee_usd", "reason",
         ] if c in tdf.columns
     ]
     disp = tdf[cols].copy()
@@ -652,12 +1285,160 @@ def _trade_table_frame(trades_df: pd.DataFrame) -> pd.DataFrame:
     for col in ["pnl", "fee_usd", "entry_price", "exit_price"]:
         if col in disp.columns:
             disp[col] = disp[col].round(2)
+    for col in ["holding_hours", "time_to_tp1_hours"]:
+        if col in disp.columns:
+            disp[col] = disp[col].round(2)
+    for col in ["close_fraction", "remaining_fraction_after"]:
+        if col in disp.columns:
+            disp[col] = (disp[col] * 100).round(1).astype(str) + "%"
     for col in ["entry_time", "exit_time"]:
         if col in disp.columns:
             disp[col] = pd.to_datetime(disp[col]).dt.strftime("%Y-%m-%d %H:%M")
     if "trade_no" in disp.columns:
         disp["trade_no"] = disp["trade_no"].astype(int)
+    if "logical_trade_no" in disp.columns:
+        disp["logical_trade_no"] = disp["logical_trade_no"].astype(int)
     return disp
+
+
+def _pine_number(value, digits: int = 8) -> str:
+    value = pd.to_numeric(value, errors="coerce")
+    if pd.isna(value) or not np.isfinite(float(value)):
+        return "na"
+    text = f"{float(value):.{digits}f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _pine_string(value) -> str:
+    text = str(value or "")
+    text = text.replace("\\", "\\\\").replace('"', '\\"')
+    text = text.replace("\r", " ").replace("\n", " ")
+    return f'"{text}"'
+
+
+def _pine_timestamp(value) -> str | None:
+    ts = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(ts):
+        return None
+    return f'timestamp("UTC",{ts.year},{ts.month},{ts.day},{ts.hour},{ts.minute})'
+
+
+def _pine_trade_add_lines(result_data: dict) -> list[str]:
+    trades_df = _normalize_chart_trades(pd.DataFrame(result_data.get("trades", [])))
+    if trades_df.empty:
+        return []
+
+    lines: list[str] = []
+    added_entries: set[int] = set()
+
+    for idx, trade in trades_df.iterrows():
+        side = str(trade.get("side", "")).strip().lower()
+        if side not in ("long", "short"):
+            continue
+
+        entry_price = pd.to_numeric(trade.get("entry_price"), errors="coerce")
+        exit_price = pd.to_numeric(trade.get("exit_price"), errors="coerce")
+        entry_ts = _pine_timestamp(trade.get("entry_time"))
+        exit_ts = _pine_timestamp(trade.get("exit_time"))
+        if pd.isna(entry_price) or entry_ts is None:
+            continue
+
+        try:
+            logical_trade_no = int(float(trade.get("logical_trade_no", trade.get("trade_no", idx + 1))))
+        except Exception:
+            logical_trade_no = int(idx) + 1
+        pnl = _pine_number(trade.get("pnl", 0.0), 8)
+        direction = side.upper()
+        entry_action, exit_action = ("BUY", "SELL") if side == "long" else ("SELL", "BUY")
+        event = str(trade.get("trade_event", "") or "").strip().upper()
+        if not event:
+            reason = str(trade.get("reason", "")).upper()
+            event = "TP2" if "TP2_PARTIAL" in reason else "TP1" if "TP1_PARTIAL" in reason else "EXIT"
+        entry_comment = f"T{logical_trade_no} OPEN {direction} {entry_action}"
+        exit_comment = f"T{logical_trade_no} {event} {direction} {exit_action}"
+
+        if logical_trade_no not in added_entries:
+            lines.append(
+                f"    f_add({entry_ts},{_pine_string(entry_action)},{_pine_number(entry_price, 8)},"
+                f"{logical_trade_no},{_pine_string(entry_comment)},{pnl})"
+            )
+            added_entries.add(logical_trade_no)
+        if pd.notna(exit_price) and exit_ts is not None:
+            lines.append(
+                f"    f_add({exit_ts},{_pine_string(exit_action)},{_pine_number(exit_price, 8)},"
+                f"{logical_trade_no},{_pine_string(exit_comment)},{pnl})"
+            )
+
+    return lines
+
+
+def _build_pine_trades_overlay(result_data: dict) -> str:
+    symbol = str(result_data.get("symbol", "asset") or "asset").upper()
+    tf = str(result_data.get("tf", "tf") or "tf")
+    mode = str(result_data.get("mode", "run") or "run").upper()
+    add_lines = _pine_trade_add_lines(result_data)
+    generated = pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    n_events = len(add_lines)
+    n_trades = len(result_data.get("trades", []) or [])
+    events_block = "\n".join(add_lines) if add_lines else "    // No trades available"
+
+    return f"""//@version=5
+indicator("BEE7 Trades Overlay with Trade Numbers", overlay=true, max_labels_count=500)
+
+// Generated by BEE7 dashboard: {generated}
+// Source: {symbol} {tf} {mode}, trades: {n_trades}, events: {n_events}
+
+showLabels = input.bool(true, "Pokaz etykiety z numerem transakcji")
+showPrice = input.bool(false, "Pokaz cene w etykiecie")
+showPnl = input.bool(false, "Pokaz PnL w etykiecie")
+showMarkers = input.bool(true, "Pokaz trojkaty BUY/SELL")
+maxLabelsToDraw = input.int(500, "Maks. etykiet", minval=0, maxval=500)
+
+var int[] txTime = array.new_int()
+var string[] txAction = array.new_string()
+var float[] txPrice = array.new_float()
+var int[] txTradeNo = array.new_int()
+var string[] txComment = array.new_string()
+var float[] txPnl = array.new_float()
+var bool[] drawn = array.new_bool()
+var int labelsDrawn = 0
+
+f_add(_t, _action, _price, _tradeNo, _comment, _pnl) =>
+    array.push(txTime, _t)
+    array.push(txAction, _action)
+    array.push(txPrice, _price)
+    array.push(txTradeNo, _tradeNo)
+    array.push(txComment, _comment)
+    array.push(txPnl, _pnl)
+    array.push(drawn, false)
+
+if barstate.isfirst
+{events_block}
+
+buyOnBar = false
+sellOnBar = false
+
+if array.size(txTime) > 0
+    for i = 0 to array.size(txTime) - 1
+        t = array.get(txTime, i)
+        inBar = time <= t and t < time_close
+        if inBar
+            action = array.get(txAction, i)
+            price = array.get(txPrice, i)
+            comment = array.get(txComment, i)
+            pnl = array.get(txPnl, i)
+            isBuy = action == "BUY"
+            buyOnBar := buyOnBar or isBuy
+            sellOnBar := sellOnBar or not isBuy
+            if showLabels and not array.get(drawn, i) and labelsDrawn < maxLabelsToDraw
+                txt = comment + (showPrice ? "\\n" + str.tostring(price, format.mintick) : "") + (showPnl ? "\\nPnL: " + str.tostring(pnl, "#.##") : "")
+                label.new(x=bar_index, y=isBuy ? low : high, text=txt, xloc=xloc.bar_index, yloc=isBuy ? yloc.belowbar : yloc.abovebar, style=isBuy ? label.style_label_up : label.style_label_down, color=isBuy ? color.lime : color.red, textcolor=color.white, size=size.small, tooltip=comment)
+                array.set(drawn, i, true)
+                labelsDrawn := labelsDrawn + 1
+
+plotshape(showMarkers and buyOnBar, title="BUY", style=shape.triangleup, location=location.belowbar, size=size.tiny, color=color.lime, text="BUY")
+plotshape(showMarkers and sellOnBar, title="SELL", style=shape.triangledown, location=location.abovebar, size=size.tiny, color=color.red, text="SELL")
+"""
 
 
 def _serialize_trade_record(trade_row: pd.Series | dict) -> dict:
@@ -727,6 +1508,317 @@ def _crop_chart_df(
     return df.iloc[start_idx:end_idx + 1].reset_index(drop=True)
 
 
+def _chart_param(params: dict | None, key: str, default):
+    params = params or {}
+    value = params.get(key, params.get(f"best_{key}", default))
+    return default if value is None else value
+
+
+def _chart_line_data(df: pd.DataFrame, column: str, precision: int) -> list[dict[str, float | int]]:
+    if column not in df.columns:
+        return []
+    series: list[dict[str, float | int]] = []
+    for row in df[["time", column]].itertuples(index=False):
+        value = getattr(row, column)
+        if pd.isna(value):
+            continue
+        series.append({"time": _unix_seconds(row.time), "value": round(float(value), precision)})
+    return series
+
+
+def _cross_markers(
+    df: pd.DataFrame,
+    wt1_col: str,
+    wt2_col: str,
+    label: str,
+    marker_prefix: str,
+) -> list[dict[str, object]]:
+    if wt1_col not in df.columns or wt2_col not in df.columns:
+        return []
+
+    prev_wt1 = df[wt1_col].shift(1)
+    prev_wt2 = df[wt2_col].shift(1)
+    green = (prev_wt1 <= prev_wt2) & (df[wt1_col] > df[wt2_col])
+    red = (prev_wt1 >= prev_wt2) & (df[wt1_col] < df[wt2_col])
+    markers: list[dict[str, object]] = []
+
+    for row in df.loc[green.fillna(False), ["time"]].itertuples(index=False):
+        markers.append(
+            {
+                "seriesId": wt1_col,
+                "time": _unix_seconds(row.time),
+                "position": "belowBar",
+                "shape": "circle",
+                "color": C["green"],
+                "text": f"{marker_prefix} L",
+                "label": f"{label} long cross",
+            }
+        )
+
+    for row in df.loc[red.fillna(False), ["time"]].itertuples(index=False):
+        markers.append(
+            {
+                "seriesId": wt1_col,
+                "time": _unix_seconds(row.time),
+                "position": "aboveBar",
+                "shape": "circle",
+                "color": C["red"],
+                "text": f"{marker_prefix} S",
+                "label": f"{label} short cross",
+            }
+        )
+
+    return markers
+
+
+def _chart_view_mode(value: str | None) -> str:
+    mode = str(value or "standard").strip().lower()
+    return mode if mode in CHART_VIEW_VALUES else "standard"
+
+
+def _fmt_diag(value, digits: int = 2) -> str:
+    try:
+        number = float(value)
+        if np.isnan(number):
+            return "n/d"
+        return f"{number:.{digits}f}"
+    except (TypeError, ValueError):
+        return "n/d"
+
+
+def _safe_diag_token(value: str) -> str:
+    return "".join(ch if ch.isalnum() else "-" for ch in str(value).lower()).strip("-") or "other"
+
+
+def _diagnostic_trade_lookup(trades_df: pd.DataFrame) -> dict[tuple[int, str], dict[str, object]]:
+    lookup: dict[tuple[int, str], dict[str, object]] = {}
+    if trades_df is None or trades_df.empty:
+        return lookup
+    for trade in trades_df.itertuples(index=False):
+        entry_time = pd.to_datetime(getattr(trade, "entry_time", None), utc=True, errors="coerce")
+        if pd.isna(entry_time):
+            continue
+        side = str(getattr(trade, "side", "")).lower()
+        if side not in ("long", "short"):
+            continue
+        lookup[(_unix_seconds(entry_time), side)] = {
+            "trade_no": int(_as_float(getattr(trade, "trade_no", 0), 0.0)),
+            "side": side,
+            "reason": str(getattr(trade, "reason", "") or ""),
+            "pnl": _as_float(getattr(trade, "pnl", 0.0), 0.0),
+        }
+    return lookup
+
+
+def _active_trade_at(trades_df: pd.DataFrame, ts: pd.Timestamp) -> dict[str, object] | None:
+    if trades_df is None or trades_df.empty:
+        return None
+    if "entry_time" not in trades_df.columns or "exit_time" not in trades_df.columns:
+        return None
+    active = trades_df[
+        (trades_df["entry_time"] <= ts)
+        & (trades_df["exit_time"] > ts)
+    ]
+    if active.empty:
+        return None
+    row = active.iloc[0]
+    return {
+        "trade_no": int(_as_float(row.get("trade_no", 0), 0.0)),
+        "side": str(row.get("side", "")).lower(),
+    }
+
+
+def _diag_h4_state(row: pd.Series, side: str, params: dict, h4_wt1_col: str, h4_wt2_col: str) -> tuple[bool, str]:
+    h4_wt1 = _as_float(row.get(h4_wt1_col, np.nan), np.nan)
+    h4_wt2 = _as_float(row.get(h4_wt2_col, np.nan), np.nan)
+    h4_delta = h4_wt1 - h4_wt2 if not np.isnan(h4_wt1) and not np.isnan(h4_wt2) else np.nan
+    h4_prev_delta = _as_float(row.get("h4_prev_wt_delta", np.nan), np.nan)
+    if any(np.isnan(v) for v in [h4_wt1, h4_wt2, h4_delta, h4_prev_delta]):
+        return False, "brak danych H4"
+
+    if side == "long":
+        threshold = float(params.get("wt_h4_long_filter_max", DEFAULT_PARAMS["wt_h4_long_filter_max"]))
+        in_zone = h4_wt1 <= threshold and h4_wt2 <= threshold
+        improving = h4_delta > h4_prev_delta
+        if not in_zone:
+            return False, f"H4 za wysoko (WT1/WT2 muszą być <= {threshold:g})"
+        if not improving:
+            return False, "delta H4 nie poprawia się dla longa"
+        return True, "H4 OK"
+
+    threshold = float(params.get("wt_h4_short_filter_min", DEFAULT_PARAMS["wt_h4_short_filter_min"]))
+    in_zone = h4_wt1 >= threshold and h4_wt2 >= threshold
+    current_gap = abs(h4_delta)
+    prev_gap = abs(h4_prev_delta)
+    converging = current_gap < prev_gap
+    correct_direction = h4_delta < h4_prev_delta
+    if not in_zone:
+        return False, f"H4 za nisko (WT1/WT2 muszą być >= {threshold:g})"
+    if not converging or not correct_direction:
+        return False, "H4 nie zbliża linii dla shorta"
+    return True, "H4 OK"
+
+
+def _diagnostic_rejection(
+    row: pd.Series,
+    side: str,
+    params: dict,
+    h1_wt1_col: str,
+    h1_wt2_col: str,
+    h4_wt1_col: str,
+    h4_wt2_col: str,
+    active_trade: dict[str, object] | None,
+) -> tuple[str, str]:
+    wt1 = _as_float(row.get(h1_wt1_col, np.nan), np.nan)
+    wt2 = _as_float(row.get(h1_wt2_col, np.nan), np.nan)
+    level_now = min(abs(wt1), abs(wt2)) if not np.isnan(wt1) and not np.isnan(wt2) else np.nan
+    min_level = float(params.get("wt_min_signal_level", DEFAULT_PARAMS["wt_min_signal_level"]))
+    allow_longs = bool(params.get("allow_longs", True))
+    allow_shorts = bool(params.get("allow_shorts", True)) and bool(params.get("short_trading_enabled", False))
+
+    if side == "long" and not allow_longs:
+        return "direction", "long wyłączony w ustawieniach"
+    if side == "short" and not allow_shorts:
+        return "direction", "short wyłączony w ustawieniach"
+    if np.isnan(wt1) or np.isnan(wt2):
+        return "data", "brak danych WT H1"
+
+    if side == "long":
+        threshold = float(params.get("wt_long_entry_max_above_zero", DEFAULT_PARAMS["wt_long_entry_max_above_zero"]))
+        if wt1 > threshold or wt2 > threshold:
+            return "zone", f"H1 poza strefą long (WT1/WT2 muszą być <= {threshold:g})"
+    else:
+        threshold = float(params.get("wt_short_entry_min_below_zero", DEFAULT_PARAMS["wt_short_entry_min_below_zero"]))
+        if wt1 < threshold or wt2 < threshold:
+            return "zone", f"H1 poza strefą short (WT1/WT2 muszą być >= {threshold:g})"
+
+    if np.isnan(level_now) or level_now < min_level:
+        return "level", f"za słaby poziom WT ({_fmt_diag(level_now)} < {min_level:g})"
+
+    h4_ok, h4_reason = _diag_h4_state(row, side, params, h4_wt1_col, h4_wt2_col)
+    if not h4_ok:
+        return "h4", h4_reason
+
+    if active_trade:
+        return "position", f"pozycja już otwarta: #{active_trade['trade_no']} {str(active_trade['side']).upper()}"
+
+    return "other", "warunki wyglądają OK, ale brak trade'u w wyniku; sprawdź okno WFO/parametry"
+
+
+def _diagnostic_signal_overlays(
+    df: pd.DataFrame,
+    trades_df: pd.DataFrame,
+    params: dict,
+    h1_wt1_col: str,
+    h1_wt2_col: str,
+    h4_wt1_col: str,
+    h4_wt2_col: str,
+    filter_mode: str = "all",
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    if df.empty or h1_wt1_col not in df.columns or h1_wt2_col not in df.columns:
+        return [], []
+
+    trade_lookup = _diagnostic_trade_lookup(trades_df)
+    filter_mode = str(filter_mode or "all").lower()
+    colors = {
+        "accepted_long": C["green"],
+        "accepted_short": C["coral"],
+        "h4": C["amber"],
+        "zone": C["blue"],
+        "position": C["muted"],
+        "direction": "#fb923c",
+        "level": C["purple"],
+        "data": C["muted"],
+        "other": "#c084fc",
+    }
+    signal_markers: list[dict[str, object]] = []
+    price_pins: list[dict[str, object]] = []
+
+    prev_wt1 = df[h1_wt1_col].shift(1)
+    prev_wt2 = df[h1_wt2_col].shift(1)
+    long_cross = (prev_wt1 <= prev_wt2) & (df[h1_wt1_col] > df[h1_wt2_col])
+    short_cross = (prev_wt1 >= prev_wt2) & (df[h1_wt1_col] < df[h1_wt2_col])
+
+    for pos, (_, row) in enumerate(df.iterrows()):
+        if bool(long_cross.iloc[pos]):
+            side = "long"
+        elif bool(short_cross.iloc[pos]):
+            side = "short"
+        else:
+            continue
+        if filter_mode in ("long", "short") and side != filter_mode:
+            continue
+
+        ts = pd.to_datetime(row["time"], utc=True, errors="coerce")
+        if pd.isna(ts):
+            continue
+        time_sec = _unix_seconds(ts)
+        accepted_trade = trade_lookup.get((time_sec, side))
+        active_trade = None if accepted_trade else _active_trade_at(trades_df, ts)
+        if accepted_trade:
+            code = "accepted"
+            reason = f"wejście wykonane jako trade #{accepted_trade['trade_no']}"
+            color = colors["accepted_long"] if side == "long" else colors["accepted_short"]
+            text = f"{'L' if side == 'long' else 'S'}✓"
+            label = f"{'LONG' if side == 'long' else 'SHORT'} #{accepted_trade['trade_no']}"
+        else:
+            code, reason = _diagnostic_rejection(
+                row,
+                side,
+                params,
+                h1_wt1_col,
+                h1_wt2_col,
+                h4_wt1_col,
+                h4_wt2_col,
+                active_trade,
+            )
+            color = colors.get(code, colors["other"])
+            text = f"{'L' if side == 'long' else 'S'}?"
+            label = f"{'LONG' if side == 'long' else 'SHORT'} odrzucony"
+
+        wt1 = _as_float(row.get(h1_wt1_col, np.nan), np.nan)
+        wt2 = _as_float(row.get(h1_wt2_col, np.nan), np.nan)
+        h4_wt1 = _as_float(row.get(h4_wt1_col, np.nan), np.nan)
+        h4_wt2 = _as_float(row.get(h4_wt2_col, np.nan), np.nan)
+        tooltip = (
+            f"{label}\n"
+            f"Decyzja: {'WEJŚCIE' if accepted_trade else 'BRAK WEJŚCIA'}\n"
+            f"Powód: {reason}\n"
+            f"WT1 H1: {_fmt_diag(wt1)} | WT2 H1: {_fmt_diag(wt2)}\n"
+            f"WT1 H4: {_fmt_diag(h4_wt1)} | WT2 H4: {_fmt_diag(h4_wt2)}\n"
+            f"Cena: {_fmt_diag(row.get('close', np.nan), 4)}"
+        )
+
+        signal_markers.append(
+            {
+                "seriesId": h1_wt1_col,
+                "time": time_sec,
+                "position": "belowBar" if side == "long" else "aboveBar",
+                "shape": "circle",
+                "color": color,
+                "text": text,
+                "label": reason,
+            }
+        )
+        price_pins.append(
+            {
+                "tradeNo": accepted_trade.get("trade_no") if accepted_trade else None,
+                "time": time_sec,
+                "price": round(float(row["close"]), 6),
+                "label": text,
+                "anchor": "below" if side == "long" else "above",
+                "kind": "signal",
+                "decision": "accepted" if accepted_trade else "rejected",
+                "rejectCode": _safe_diag_token(code),
+                "side": side,
+                "color": color,
+                "tooltip": tooltip,
+            }
+        )
+
+    return signal_markers, price_pins
+
+
 def lightweight_chart_payload(
     symbol: str,
     tf: str,
@@ -735,13 +1827,17 @@ def lightweight_chart_payload(
     selected_trade: dict | None = None,
     filter_mode: str = "all",
     params: dict | None = None,
+    view_mode: str = "standard",
 ) -> dict[str, object]:
+    view_mode = _chart_view_mode(view_mode)
     source_df = _chart_source_df(symbol, tf)
     if source_df is None or source_df.empty:
         return {
+            "chartView": view_mode,
             "candles": [],
             "lines": [],
             "signalLines": [],
+            "signalMarkers": [],
             "markers": [],
             "tradePins": [],
             "focusRange": None,
@@ -758,9 +1854,11 @@ def lightweight_chart_payload(
     )
     if df.empty:
         return {
+            "chartView": view_mode,
             "candles": [],
             "lines": [],
             "signalLines": [],
+            "signalMarkers": [],
             "markers": [],
             "tradePins": [],
             "focusRange": None,
@@ -805,30 +1903,61 @@ def lightweight_chart_payload(
             }
         )
 
+    channel_len = int(_chart_param(params, "wt_channel_len", DEFAULT_PARAMS["wt_channel_len"]))
+    avg_len = int(_chart_param(params, "wt_avg_len", DEFAULT_PARAMS["wt_avg_len"]))
+    signal_len = int(_chart_param(params, "wt_signal_len", DEFAULT_PARAMS["wt_signal_len"]))
+    h4_interval = str(_chart_param(params, "wt_h4_filter_interval", DEFAULT_PARAMS["wt_h4_filter_interval"]))
+
+    h1_wt1_col, h1_wt2_col = wt_columns(channel_len, avg_len, signal_len)
+    h4_wt1_col = htf_wt1_column(channel_len, avg_len, h4_interval)
+    h4_wt2_col = htf_wt2_column(channel_len, avg_len, signal_len, h4_interval)
+    if h1_wt1_col not in df.columns or h1_wt2_col not in df.columns:
+        h1_wt1_col, h1_wt2_col = "wt1", "wt2"
+    if h4_wt1_col not in df.columns or h4_wt2_col not in df.columns:
+        h4_wt1_col, h4_wt2_col = "h4_wt1", "h4_wt2"
+
     signal_specs = [
-        ("wt1", "WT1", C["blue"], 1.9, True),
-        ("wt2", "WT2", C["amber"], 2.2, True),
+        (h1_wt1_col, f"WT1 H1 ({channel_len}/{avg_len})", C["blue"], 2.0, True, 0),
+        (h1_wt2_col, f"WT2 H1 ({signal_len})", C["amber"], 2.1, True, 0),
+        (h4_wt1_col, f"WT1 H4 ({channel_len}/{avg_len})", C["purple"], 3.0, True, 0),
+        (h4_wt2_col, f"WT2 H4 ({signal_len})", C["coral"], 3.2, True, 0),
     ]
     signal_lines = []
-    for column, label, color, width, visible in signal_specs:
+    for column, label, color, width, visible, line_style in signal_specs:
         if column not in df.columns:
             continue
-        series = []
-        for row in df[["time", column]].itertuples(index=False):
-            value = getattr(row, column)
-            if pd.isna(value):
-                continue
-            series.append({"time": _unix_seconds(row.time), "value": round(float(value), 4)})
         signal_lines.append(
             {
                 "id": column,
                 "label": label,
                 "color": color,
                 "lineWidth": width,
+                "lineStyle": line_style,
                 "visible": visible,
-                "data": series,
+                "data": _chart_line_data(df, column, 4),
             }
         )
+
+    h1_cross_markers = _cross_markers(df, h1_wt1_col, h1_wt2_col, "H1", "H1")
+    h4_cross_markers = _cross_markers(df, h4_wt1_col, h4_wt2_col, "H4", "H4")
+    diagnostic_signal_markers: list[dict[str, object]] = []
+    diagnostic_pins: list[dict[str, object]] = []
+    if view_mode == "diagnostic":
+        diagnostic_signal_markers, diagnostic_pins = _diagnostic_signal_overlays(
+            df,
+            normalized_trades,
+            params,
+            h1_wt1_col,
+            h1_wt2_col,
+            h4_wt1_col,
+            h4_wt2_col,
+            filter_mode=filter_mode,
+        )
+        signal_markers = diagnostic_signal_markers + h4_cross_markers
+    elif view_mode == "trades":
+        signal_markers = []
+    else:
+        signal_markers = h1_cross_markers + h4_cross_markers
 
     time_values = [_unix_seconds(ts) for ts in df["time"]]
     level_specs = [
@@ -852,43 +1981,48 @@ def lightweight_chart_payload(
 
     markers: list[dict[str, object]] = []
     trade_pins: list[dict[str, object]] = []
+    added_entry_markers: set[int] = set()
     if not filtered_trades.empty:
         for trade in filtered_trades.itertuples(index=False):
             trade_no = int(_as_float(getattr(trade, "trade_no", 0), 0.0))
+            logical_trade_no = int(_as_float(getattr(trade, "logical_trade_no", trade_no), float(trade_no)))
+            trade_label = str(getattr(trade, "trade_label", "") or f"{logical_trade_no} EXIT")
             side = str(getattr(trade, "side", "")).lower()
             pnl = _as_float(getattr(trade, "pnl", 0.0), 0.0)
             reason = str(getattr(trade, "reason", "") or "")
             entry_price = _as_float(getattr(trade, "entry_price", 0.0), 0.0)
             exit_price = _as_float(getattr(trade, "exit_price", 0.0), 0.0)
-            markers.append(
-                {
-                    "time": _unix_seconds(trade.entry_time),
-                    "position": "belowBar" if side == "long" else "aboveBar",
-                    "shape": "arrowUp" if side == "long" else "arrowDown",
-                    "color": C["green"] if side == "long" else C["coral"],
-                    "text": f"#{trade_no}",
-                }
-            )
+            if logical_trade_no not in added_entry_markers:
+                markers.append(
+                    {
+                        "time": _unix_seconds(trade.entry_time),
+                        "position": "belowBar" if side == "long" else "aboveBar",
+                        "shape": "arrowUp" if side == "long" else "arrowDown",
+                        "color": C["green"] if side == "long" else C["coral"],
+                        "text": f"#{logical_trade_no}",
+                    }
+                )
+                trade_pins.append(
+                    {
+                        "tradeNo": trade_no,
+                        "time": _unix_seconds(trade.entry_time),
+                        "price": round(entry_price, 6),
+                        "label": f"{logical_trade_no} OPEN",
+                        "anchor": "below" if side == "long" else "above",
+                        "kind": "entry",
+                        "side": side,
+                        "color": C["green"] if side == "long" else C["coral"],
+                        "tooltip": f"Trade {logical_trade_no} open | {side.upper()} | {reason or 'OPEN'}",
+                    }
+                )
+                added_entry_markers.add(logical_trade_no)
             markers.append(
                 {
                     "time": _unix_seconds(trade.exit_time),
                     "position": "aboveBar" if side == "long" else "belowBar",
                     "shape": "circle",
                     "color": "#22c55e" if pnl >= 0 else "#ef4444",
-                    "text": f"#{trade_no}",
-                }
-            )
-            trade_pins.append(
-                {
-                    "tradeNo": trade_no,
-                    "time": _unix_seconds(trade.entry_time),
-                    "price": round(entry_price, 6),
-                    "label": f"#{trade_no}",
-                    "anchor": "below" if side == "long" else "above",
-                    "kind": "entry",
-                    "side": side,
-                    "color": C["green"] if side == "long" else C["coral"],
-                    "tooltip": f"Trade #{trade_no} entry | {side.upper()} | {reason or 'OPEN'}",
+                    "text": trade_label,
                 }
             )
             trade_pins.append(
@@ -896,14 +2030,17 @@ def lightweight_chart_payload(
                     "tradeNo": trade_no,
                     "time": _unix_seconds(trade.exit_time),
                     "price": round(exit_price, 6),
-                    "label": f"#{trade_no}",
+                    "label": trade_label,
                     "anchor": "above" if side == "long" else "below",
                     "kind": "exit",
                     "side": side,
                     "color": "#22c55e" if pnl >= 0 else "#ef4444",
-                    "tooltip": f"Trade #{trade_no} exit | {side.upper()} | {reason or f'{pnl:+.2f} USD'}",
+                    "tooltip": f"Trade {trade_label} | {side.upper()} | {reason or f'{pnl:+.2f} USD'}",
                 }
             )
+
+    if view_mode == "diagnostic":
+        trade_pins.extend(diagnostic_pins)
 
     if windows_df is not None and not windows_df.empty and "live_start" in windows_df.columns and len(windows_df) <= 20:
         for row in windows_df.itertuples(index=False):
@@ -940,9 +2077,11 @@ def lightweight_chart_payload(
     return {
         "symbol": symbol,
         "tf": tf,
+        "chartView": view_mode,
         "candles": candles,
         "lines": lines,
         "signalLines": signal_lines,
+        "signalMarkers": signal_markers,
         "markers": markers,
         "tradePins": trade_pins,
         "focusRange": focus_range,
@@ -1207,6 +2346,7 @@ def fig_chart(
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
 def sidebar():
     SW = "285px"
+    saved_opts = _saved_result_options()
     return html.Div([
         # nagłówek
         html.Div([
@@ -1249,10 +2389,8 @@ def sidebar():
                 {"label": "WFO", "value": "wfo"},
             ], "wfo")),
             field("Kierunek", drp("inp-direction", [
-                {"label": "Oba kierunki", "value": "both"},
-                {"label": "Tylko long", "value": "long"},
-                {"label": "Tylko short", "value": "short"},
-            ], DEFAULT_PARAMS.get("trade_direction", "both"))),
+                {"label": "Tylko long (short OFF)", "value": "long"},
+            ], "long")),
             html.Div([
                 html.Div([field("Fee rate %", inp("inp-fee", round(FEE_RATE*100,4),
                                                    type="number",min=0,max=1,step=0.001))],style={"flex":"1"}),
@@ -1268,24 +2406,38 @@ def sidebar():
             html.Div([
                 html.Div([field("Channel", inp("inp-bt-channel", DEFAULT_PARAMS["wt_channel_len"], type="number", min=2, step=1))], style={"flex":"1"}),
                 html.Div([field("Average", inp("inp-bt-avg", DEFAULT_PARAMS["wt_avg_len"], type="number", min=2, step=1))], style={"flex":"1"}),
-            ], style={"display":"flex","gap":"8px"}),
+            ], style={"display":"none"}),
             html.Div([
                 html.Div([field("Signal", inp("inp-bt-signal", DEFAULT_PARAMS["wt_signal_len"], type="number", min=2, step=1))], style={"flex":"1"}),
                 html.Div(
                     [field("Min level", inp("inp-bt-min-level", DEFAULT_PARAMS["wt_min_signal_level"], type="number", step=1))],
                     style={"display":"none"},
                 ),
+            ], style={"display":"none"}),
+            html.Div([
+                html.Div([field("Long open level H1", inp("inp-bt-long-zone", DEFAULT_PARAMS["wt_long_entry_max_above_zero"], type="number", step=1))], style={"flex":"1"}),
+                html.Div([field("Long close level H1", inp("inp-bt-long-close-level", DEFAULT_PARAMS["wt_long_close_min_level"], type="number", step=1))], style={"flex":"1"}),
+                html.Div([field("Short zone H1", inp("inp-bt-short-zone", DEFAULT_PARAMS["wt_short_entry_min_below_zero"], type="number", step=1))], style={"display":"none"}),
             ], style={"display":"flex","gap":"8px"}),
             html.Div([
-                html.Div([field("Long zone H1", inp("inp-bt-long-zone", DEFAULT_PARAMS["wt_long_entry_max_above_zero"], type="number", step=1))], style={"flex":"1"}),
-                html.Div([field("Short zone H1", inp("inp-bt-short-zone", DEFAULT_PARAMS["wt_short_entry_min_below_zero"], type="number", step=1))], style={"flex":"1"}),
+                html.Div([field("Long open level H4", inp("inp-bt-h4-long", DEFAULT_PARAMS["wt_h4_long_filter_max"], type="number", step=1))], style={"flex":"1"}),
+                html.Div([field("Long close level H4", inp("inp-bt-h4-long-close", DEFAULT_PARAMS["wt_h4_long_close_min"], type="number", step=1))], style={"flex":"1"}),
+                html.Div([field("Short filter H4", inp("inp-bt-h4-short", DEFAULT_PARAMS["wt_h4_short_filter_min"], type="number", step=1))], style={"display":"none"}),
             ], style={"display":"flex","gap":"8px"}),
             html.Div([
-                html.Div([field("Long filter H4", inp("inp-bt-h4-long", DEFAULT_PARAMS["wt_h4_long_filter_max"], type="number", step=1))], style={"flex":"1"}),
-                html.Div([field("Short filter H4", inp("inp-bt-h4-short", DEFAULT_PARAMS["wt_h4_short_filter_min"], type="number", step=1))], style={"flex":"1"}),
+                html.Div([field("TP1 % long", inp("inp-bt-long-tp1-pct", round(DEFAULT_PARAMS["wt_long_tp1_pct"] * 100.0, 2), type="number", min=0, step=0.1))], style={"flex":"1"}),
+                html.Div([field("Stop loss", drp(
+                    "inp-bt-long-sl-pct",
+                    [{"label": "Wyłączony", "value": 0.0}] + [
+                        {"label": f"{v * 100:.0f}%", "value": v}
+                        for v in WT_LONG_EMERGENCY_SL_CAPITAL_PCT_OPTIONS
+                        if v > 0.0
+                    ],
+                    DEFAULT_PARAMS["wt_long_emergency_sl_capital_pct"],
+                ))], style={"flex":"1"}),
             ], style={"display":"flex","gap":"8px"}),
             html.Div([
-                html.Div([field("Re-entry", inp("inp-bt-reentry", DEFAULT_PARAMS["wt_long_entry_window_bars"], type="number", min=0, max=12, step=1))], style={"display":"none"}),
+                html.Div([field("Entry window H1", inp("inp-bt-reentry", DEFAULT_PARAMS["wt_long_entry_window_bars"], type="number", min=0, max=12, step=1))], style={"flex":"1"}),
                 html.Div([field("EMA filter", drp("inp-bt-ema-filter", [
                     {"label": "Off", "value": False},
                     {"label": "On", "value": True},
@@ -1299,7 +2451,7 @@ def sidebar():
                 html.Div([field("EMA length", inp("inp-bt-ema-len", DEFAULT_PARAMS["wt_ema_filter_len"], type="number", min=2, max=200, step=1))], style={"display":"none"}),
             ], style={"display":"flex","gap":"8px"}),
             html.Div(
-                "BEE7_2: wejście jest od razu na świeżej kropce H1 w głębokiej strefie WT, a filtr robią dwie linie WaveTrend z H4. Stop loss, re-entry i filtry EMA są wyłączone, a awaryjny exit zamyka pozycję gdy H4 zaczyna przeczyć setupowi.",
+                "BEE7: short jest wyłączony. Entry window H1 pozwala wejść kilka świec po zielonej kropce. Open level działa jako poziom lub niżej, close level jako poziom lub wyżej. TP1 zamyka 1/3 longa przy +1%, a jeżeli przed TP2 cena wróci do wejścia, reszta wychodzi na break-even. Stop loss może być wyłączony albo ustawiony na 1/2/5/10%.",
                 style={"fontSize":"11px","color":C["muted"],"marginTop":"4px"},
             ),
         ],style=card_s),
@@ -1315,37 +2467,59 @@ def sidebar():
                 {"label":"Return only", "value":"return_only"},
                 {"label":"Defensive",   "value":"defensive"},
             ],"balanced")),
-            sec("Siatka Channel"),
-            dcc.Checklist(id="chk-grid-channel",
-                options=[{"label":f" {v}","value":v}
-                         for v in WT_CHANNEL_LEN_GRID],
-                value=WT_CHANNEL_LEN_GRID, inline=True,
-                inputStyle={"marginRight":"4px","accentColor":C["blue"]},
-                labelStyle={"color":"#e8eaf6","fontSize":"12px","marginRight":"10px"}),
-            sec("Siatka Average"),
-            dcc.Checklist(id="chk-grid-avg",
-                options=[{"label":f" {v}","value":v}
-                         for v in WT_AVG_LEN_GRID],
-                value=WT_AVG_LEN_GRID, inline=True,
-                inputStyle={"marginRight":"4px","accentColor":C["blue"]},
-                labelStyle={"color":"#e8eaf6","fontSize":"12px","marginRight":"10px"}),
-            sec("Siatka Signal"),
-            dcc.Checklist(id="chk-grid-signal",
-                options=[{"label":f" {v}","value":v} for v in WT_SIGNAL_LEN_GRID],
-                value=WT_SIGNAL_LEN_GRID, inline=True,
-                inputStyle={"marginRight":"4px","accentColor":C["blue"]},
-                labelStyle={"color":"#e8eaf6","fontSize":"12px","marginRight":"10px"}),
+            html.Div(
+                "WaveTrend WFO fixed: Channel 10 / Average 21 / Signal 3",
+                style={"fontSize":"11px","color":C["muted"],"marginTop":"4px","marginBottom":"8px"},
+            ),
+            html.Div([
+                sec("Siatka Channel"),
+                dcc.Checklist(id="chk-grid-channel",
+                    options=[{"label":f" {v}","value":v}
+                             for v in WT_CHANNEL_LEN_GRID],
+                    value=WT_CHANNEL_LEN_GRID, inline=True,
+                    inputStyle={"marginRight":"4px","accentColor":C["blue"]},
+                    labelStyle={"color":"#e8eaf6","fontSize":"12px","marginRight":"10px"}),
+                sec("Siatka Average"),
+                dcc.Checklist(id="chk-grid-avg",
+                    options=[{"label":f" {v}","value":v}
+                             for v in WT_AVG_LEN_GRID],
+                    value=WT_AVG_LEN_GRID, inline=True,
+                    inputStyle={"marginRight":"4px","accentColor":C["blue"]},
+                    labelStyle={"color":"#e8eaf6","fontSize":"12px","marginRight":"10px"}),
+                sec("Siatka Signal"),
+                dcc.Checklist(id="chk-grid-signal",
+                    options=[{"label":f" {v}","value":v} for v in WT_SIGNAL_LEN_GRID],
+                    value=WT_SIGNAL_LEN_GRID, inline=True,
+                    inputStyle={"marginRight":"4px","accentColor":C["blue"]},
+                    labelStyle={"color":"#e8eaf6","fontSize":"12px","marginRight":"10px"}),
+            ], style={"display":"none"}),
+            html.Div([
+                sec("Entry window H1"),
+                dcc.Checklist(id="chk-grid-reentry",
+                    options=[{"label":f" {v}","value":v} for v in WT_REENTRY_WINDOW_GRID],
+                    value=WT_REENTRY_WINDOW_GRID, inline=True,
+                    inputStyle={"marginRight":"4px","accentColor":C["blue"]},
+                    labelStyle={"color":"#e8eaf6","fontSize":"12px","marginRight":"10px"}),
+            ]),
+            html.Div([
+                sec("Stop loss"),
+                dcc.Checklist(id="chk-grid-long-sl-pct",
+                    options=[
+                        {
+                            "label": " Wyłączony" if v == 0.0 else f" {v * 100:.0f}%",
+                            "value": v,
+                        }
+                        for v in WT_LONG_EMERGENCY_SL_CAPITAL_PCT_OPTIONS
+                    ],
+                    value=WT_LONG_EMERGENCY_SL_CAPITAL_PCT_GRID, inline=True,
+                    inputStyle={"marginRight":"4px","accentColor":C["blue"]},
+                    labelStyle={"color":"#e8eaf6","fontSize":"12px","marginRight":"10px"}),
+            ]),
             html.Div([
                 sec("Siatka Min level"),
                 dcc.Checklist(id="chk-grid-min-level",
                     options=[{"label":f" {v:.1f}","value":v} for v in WT_MIN_SIGNAL_LEVEL_OPTIONS],
                     value=WT_MIN_SIGNAL_LEVEL_GRID, inline=True,
-                    inputStyle={"marginRight":"4px","accentColor":C["blue"]},
-                    labelStyle={"color":"#e8eaf6","fontSize":"12px","marginRight":"10px"}),
-                sec("Siatka Re-entry"),
-                dcc.Checklist(id="chk-grid-reentry",
-                    options=[{"label":f" {v}","value":v} for v in WT_REENTRY_WINDOW_GRID],
-                    value=WT_REENTRY_WINDOW_GRID, inline=True,
                     inputStyle={"marginRight":"4px","accentColor":C["blue"]},
                     labelStyle={"color":"#e8eaf6","fontSize":"12px","marginRight":"10px"}),
                 sec("Siatka EMA on/off"),
@@ -1373,32 +2547,48 @@ def sidebar():
                     inputStyle={"marginRight":"4px","accentColor":C["blue"]},
                     labelStyle={"color":"#e8eaf6","fontSize":"12px","marginRight":"10px"}),
             ], style={"display":"none"}),
-            sec("Long zone max"),
+            sec("Long open level H1"),
             dcc.Checklist(id="chk-grid-long-zone",
                 options=[{"label":f" {v:.1f}","value":v} for v in WT_LONG_ENTRY_MAX_ABOVE_ZERO_OPTIONS],
                 value=WT_LONG_ENTRY_MAX_ABOVE_ZERO_GRID, inline=True,
                 inputStyle={"marginRight":"4px","accentColor":C["blue"]},
                 labelStyle={"color":"#e8eaf6","fontSize":"12px","marginRight":"10px"}),
-            sec("Short zone min"),
-            dcc.Checklist(id="chk-grid-short-zone",
-                options=[{"label":f" {v:.1f}","value":v} for v in WT_SHORT_ENTRY_MIN_BELOW_ZERO_OPTIONS],
-                value=WT_SHORT_ENTRY_MIN_BELOW_ZERO_GRID, inline=True,
+            sec("Long close level H1"),
+            dcc.Checklist(id="chk-grid-long-close-level",
+                options=[{"label":f" {v:.1f}","value":v} for v in WT_LONG_CLOSE_MIN_LEVEL_OPTIONS],
+                value=WT_LONG_CLOSE_MIN_LEVEL_GRID, inline=True,
                 inputStyle={"marginRight":"4px","accentColor":C["blue"]},
                 labelStyle={"color":"#e8eaf6","fontSize":"12px","marginRight":"10px"}),
-            sec("Long filter H4"),
+            html.Div([
+                sec("Short zone min"),
+                dcc.Checklist(id="chk-grid-short-zone",
+                    options=[{"label":f" {v:.1f}","value":v} for v in WT_SHORT_ENTRY_MIN_BELOW_ZERO_OPTIONS],
+                    value=[DEFAULT_PARAMS["wt_short_entry_min_below_zero"]], inline=True,
+                    inputStyle={"marginRight":"4px","accentColor":C["blue"]},
+                    labelStyle={"color":"#e8eaf6","fontSize":"12px","marginRight":"10px"}),
+            ], style={"display":"none"}),
+            sec("Long open level H4"),
             dcc.Checklist(id="chk-grid-h4-long",
                 options=[{"label":f" {v:.1f}","value":v} for v in WT_H4_LONG_FILTER_MAX_OPTIONS],
                 value=WT_H4_LONG_FILTER_MAX_GRID, inline=True,
                 inputStyle={"marginRight":"4px","accentColor":C["blue"]},
                 labelStyle={"color":"#e8eaf6","fontSize":"12px","marginRight":"10px"}),
-            sec("Short filter H4"),
-            dcc.Checklist(id="chk-grid-h4-short",
-                options=[{"label":f" {v:.1f}","value":v} for v in WT_H4_SHORT_FILTER_MIN_OPTIONS],
-                value=WT_H4_SHORT_FILTER_MIN_GRID, inline=True,
+            sec("Long close level H4"),
+            dcc.Checklist(id="chk-grid-h4-long-close",
+                options=[{"label":f" {v:.1f}","value":v} for v in WT_H4_LONG_CLOSE_MIN_OPTIONS],
+                value=WT_H4_LONG_CLOSE_MIN_GRID, inline=True,
                 inputStyle={"marginRight":"4px","accentColor":C["blue"]},
                 labelStyle={"color":"#e8eaf6","fontSize":"12px","marginRight":"10px"}),
+            html.Div([
+                sec("Short filter H4"),
+                dcc.Checklist(id="chk-grid-h4-short",
+                    options=[{"label":f" {v:.1f}","value":v} for v in WT_H4_SHORT_FILTER_MIN_OPTIONS],
+                    value=[DEFAULT_PARAMS["wt_h4_short_filter_min"]], inline=True,
+                    inputStyle={"marginRight":"4px","accentColor":C["blue"]},
+                    labelStyle={"color":"#e8eaf6","fontSize":"12px","marginRight":"10px"}),
+            ], style={"display":"none"}),
             html.Div(
-                "WFO w BEE7_2 testuje głębokość wejścia H1, osobne progi H4 dla long/short oraz klasyczne długości WaveTrend. Awaryjny exit H4 jest stały i włączony.",
+                "WFO w BEE7 testuje tylko long: entry window H1, open level H1/H4, close level H1/H4 oraz stop loss. Open level oznacza wartość lub niżej, close level wartość lub wyżej.",
                 style={"fontSize":"11px","color":C["muted"],"marginTop":"8px"},
             ),
         ],id="panel-wfo",style=card_s),
@@ -1419,6 +2609,40 @@ def sidebar():
             "fontSize":"12px","color":C["muted"],"textAlign":"center","minHeight":"20px"}),
         html.Div(id="run-progress",style={
             "fontSize":"12px","color":C["amber"],"textAlign":"center","minHeight":"16px","marginTop":"4px"}),
+
+        html.Div([
+            sec("Zapis / odczyt wyników"),
+            html.Div([
+                html.Button("Zapisz wynik", id="btn-save-result", n_clicks=0, style={
+                    "flex":"1","background":C["surf2"],"border":f"1px solid {C['border']}",
+                    "borderRadius":"10px","color":C["text"],"padding":"9px 10px",
+                    "fontSize":"12px","fontWeight":"600","cursor":"pointer"}),
+                html.Button("Odśwież", id="btn-refresh-results", n_clicks=0, style={
+                    "width":"88px","background":"transparent","border":f"1px solid {C['border']}",
+                    "borderRadius":"10px","color":C["muted"],"padding":"9px 10px",
+                    "fontSize":"12px","fontWeight":"600","cursor":"pointer"}),
+            ], style={"display":"flex","gap":"8px","marginBottom":"10px"}),
+            dcc.Dropdown(
+                id="saved-result-select",
+                options=saved_opts,
+                value=(saved_opts[0]["value"] if saved_opts else None),
+                clearable=False,
+                placeholder="Brak zapisanych wyników",
+                className="wt-drp",
+                style={"color":"#0b1220"},
+            ),
+            html.Button("Wczytaj wybrany plik", id="btn-load-result", n_clicks=0, style={
+                "width":"100%","background":C["blue"],"border":"none","borderRadius":"10px",
+                "color":"#fff","padding":"10px","fontSize":"12px","fontWeight":"700",
+                "cursor":"pointer","marginTop":"10px"}),
+            html.Button("Raport PDF", id="btn-report-pdf", n_clicks=0, style={
+                "width":"100%","background":C["green"],"border":"none","borderRadius":"10px",
+                "color":"#07111b","padding":"10px","fontSize":"12px","fontWeight":"800",
+                "cursor":"pointer","marginTop":"8px"}),
+            html.Div(id="saved-result-status", style={
+                "fontSize":"11px","color":C["muted"],"textAlign":"center",
+                "minHeight":"16px","marginTop":"8px","lineHeight":"1.4"}),
+        ], style={**card_s, "padding":"14px 16px"}),
 
         dcc.Store(id="store-result"),
         dcc.Store(id="store-run-meta", data={"running": False}),
@@ -1454,9 +2678,12 @@ def main_panel():
         html.Div(id="tab-content"),
         dcc.Store(id="store-selected-trade", data=None),
         dcc.Store(id="store-chart-filter",   data="all"),
+        dcc.Store(id="store-chart-view",     data="standard"),
         dcc.Store(id="store-chart-payload",  data=None),
         dcc.Store(id="store-server-token",   data=None, storage_type="session"),
         dcc.Download(id="download-trades"),
+        dcc.Download(id="download-pine-trades"),
+        dcc.Download(id="download-report"),
         html.Div(id="chart-render-signal", style={"display":"none"}),
         dcc.Interval(id="poll",interval=15000,n_intervals=0),
         dcc.Location(id="_url", refresh=True),
@@ -1641,6 +2868,10 @@ def _worker(
     bt_short_zone,
     bt_h4_long,
     bt_h4_short,
+    bt_long_close_level,
+    bt_h4_long_close,
+    bt_long_tp1_pct,
+    bt_long_sl_pct,
     grid_channel,
     grid_avg,
     grid_signal,
@@ -1653,6 +2884,9 @@ def _worker(
     grid_short_zone,
     grid_h4_long,
     grid_h4_short,
+    grid_long_close_level,
+    grid_h4_long_close,
+    grid_long_sl_pct,
 ):
 
     csv_path = str(_APP_DIR / f"{symbol.lower()}_{tf}.csv")
@@ -1694,7 +2928,12 @@ def _worker(
         df = df.reset_index(drop=True)
 
         if len(df) < 100:
-            ss(running=False, status="✗ Za mało danych po filtrowaniu.", progress=""); return
+            ss(
+                running=False,
+                status=f"✗ Za mało danych po filtrowaniu: zostało {len(df)} świec, minimum 100.",
+                progress="Sprawdź zakres dat, timeframe albo czy CSV po pobraniu zawiera wybrany okres.",
+            )
+            return
 
         fee_rate_val = float(fee if fee is not None and fee != "" else FEE_RATE * 100) / 100.0
         slip_bps_val = float(slip if slip is not None and slip != "" else DEFAULT_PARAMS.get("slippage_bps", 0.0))
@@ -1713,12 +2952,20 @@ def _worker(
             bt_short_zone,
             bt_h4_long,
             bt_h4_short,
+            bt_long_close_level,
+            bt_h4_long_close,
+            bt_long_tp1_pct,
+            bt_long_sl_pct,
             fee_rate_val,
             slip_bps_val,
         )
 
         if run_mode == "backtest":
-            ss(status="Backtest w toku...", progress="")
+            bt_started_at = _time.time()
+            ss(
+                status="Backtest w toku...",
+                progress=f"Przetwarzam {len(df)} świec  |  czas 0s  |  ETA liczę...",
+            )
             strat = Bee7Strategy(strategy_params, fee_rate=fee_rate_val)
             trades_bt, equity_bt, _ = strat.run(df, capital)
             stats = compute_stats(trades_bt, equity_bt, capital, print_output=False)
@@ -1745,12 +2992,13 @@ def _worker(
             }
             n = len(trades_bt)
             ret = stats.get("net_return_pct", 0)
+            bt_elapsed = _fmt_duration(_time.time() - bt_started_at)
             ss(
                 running=False,
                 stop=False,
                 result=result,
                 status=f"✓ Backtest gotowy  |  {n} tradów  |  {ret:+.2f}%",
-                progress="",
+                progress=f"Czas wykonania: {bt_elapsed}",
             )
             return
 
@@ -1769,29 +3017,45 @@ def _worker(
             grid_short_zone,
             grid_h4_long,
             grid_h4_short,
+            grid_long_close_level,
+            grid_h4_long_close,
+            grid_long_sl_pct,
         )
 
         ob, lb = wfo_bars(tf, opt_days_val, live_days_val)
         total  = max(0, (len(df)-ob)//lb)
         combo_total = _grid_combo_count(grid_overrides)
+        wfo_started_at = _time.time()
+        progress_total_windows = max(total, 1)
+        progress_combo_total = max(combo_total, 1)
+        total_progress_units = max(1, progress_total_windows * progress_combo_total)
+
+        def _wfo_progress_text(wid, total_windows, combo_idx, combo_count):
+            total_windows = max(int(total_windows or 0), 1)
+            combo_count = max(int(combo_count or 0), 1)
+            window_idx = max(0, min(int(wid or 0), total_windows - 1))
+            combo_idx = max(0, min(int(combo_idx or 0), combo_count))
+            done_units = min(total_progress_units, window_idx * combo_count + combo_idx)
+            elapsed, eta = _elapsed_eta(wfo_started_at, done_units, total_progress_units)
+            window_pct = combo_idx / combo_count * 100.0
+            total_pct = done_units / total_progress_units * 100.0
+            return (
+                f"Okno {window_idx + 1} / {total_windows}  |  "
+                f"kombinacja {combo_idx} / {combo_count}  |  "
+                f"{window_pct:.0f}% okna  |  całość {total_pct:.1f}%  |  "
+                f"czas {elapsed}  |  ETA {eta}"
+            )
+
         ss(
             status=f"WFO w toku  |  ~{total} okien  |  {combo_total} kombinacji/okno",
-            progress=f"Okno 1 / {max(total, 1)}  |  kombinacja 0 / {combo_total}",
+            progress=_wfo_progress_text(0, progress_total_windows, 0, progress_combo_total),
         )
 
         def _on_combo_progress(wid, total_windows, combo_idx, combo_total):
-            total_windows = max(int(total_windows or 0), 1)
-            window_no = int(wid) + 1
-            pct = (combo_idx / combo_total * 100.0) if combo_total else 0.0
-            ss(
-                progress=(
-                    f"Okno {window_no} / {total_windows}  |  "
-                    f"kombinacja {combo_idx} / {combo_total}  |  {pct:.0f}%"
-                )
-            )
+            ss(progress=_wfo_progress_text(wid, total_windows, combo_idx, combo_total))
 
         def _on_window_done(wid, total, wstats, trades_list, equity_sofar, cap_sofar):
-            ss(progress=f"Okno {wid + 1} / {total}  |  kombinacja {combo_total} / {combo_total}  |  100%")
+            ss(progress=_wfo_progress_text(wid, total, combo_total, combo_total))
             # Zbuduj wynik cząstkowy i od razu go wyświetl
             try:
                 all_tr = pd.concat(trades_list, ignore_index=True) \
@@ -1869,20 +3133,21 @@ def _worker(
         nw  = len(windows_df) if windows_df is not None and not windows_df.empty else 0
         n   = len(all_trades) if all_trades is not None and not all_trades.empty else 0
         ret = stats.get("net_return_pct", 0)
+        wfo_elapsed = _fmt_duration(_time.time() - wfo_started_at)
         if stopped:
             ss(
                 running=False,
                 stop=False,
                 result=result,
                 status=f"Zatrzymano  |  ukończone okna {nw}/{total}  |  {n} tradów  |  {ret:+.2f}%",
-                progress="",
+                progress=f"Czas wykonania: {wfo_elapsed}",
             )
             return
 
         ss(running=False, stop=False, result=result,
            status=f"✓ WFO gotowe  |  {nw} okien  |  {n} tradów  |  {ret:+.2f}%"
                   + ("  |  zapisano best params" if best_params else ""),
-           progress="")
+           progress=f"Czas wykonania: {wfo_elapsed}")
 
     except Exception as e:
         import traceback
@@ -1914,6 +3179,15 @@ def check_server_token(_, stored_token):
 )
 def on_chart_filter(fval):
     return fval
+
+
+@app.callback(
+    Output("store-chart-view","data"),
+    Input("chart-view-radio","value"),
+    prevent_initial_call=True,
+)
+def on_chart_view(value):
+    return _chart_view_mode(value)
 
 # ─── Callback: klik w tabeli → zoom na wykresie ───────────────────────────────
 @app.callback(
@@ -1973,6 +3247,108 @@ def export_trades(n_clicks, result_data):
     filename = f"bee7_{mode}_{symbol}_{tf}_trades_{stamp}.csv"
     return dcc.send_data_frame(export_df.to_csv, filename, index=False, encoding="utf-8-sig")
 
+
+@app.callback(
+    Output("download-pine-trades", "data"),
+    Input("btn-export-pine-trades", "n_clicks"),
+    State("store-result", "data"),
+    prevent_initial_call=True,
+)
+def export_trades_pine(n_clicks, result_data):
+    if not n_clicks or not result_data:
+        return dash.no_update
+
+    script = _build_pine_trades_overlay(result_data)
+    if not script.strip():
+        return dash.no_update
+
+    mode = str(result_data.get("mode", "run")).lower()
+    symbol = str(result_data.get("symbol", "asset")).upper()
+    tf = str(result_data.get("tf", "tf")).lower()
+    stamp = pd.Timestamp.utcnow().strftime("%Y%m%d_%H%M%S")
+    filename = f"bee7_{mode}_{symbol}_{tf}_trades_overlay_{stamp}.pine"
+    return dcc.send_string(script, filename)
+
+
+@app.callback(
+    Output("download-report", "data"),
+    Output("saved-result-status", "children", allow_duplicate=True),
+    Input("btn-report-pdf", "n_clicks"),
+    State("store-result", "data"),
+    prevent_initial_call=True,
+)
+def export_report_pdf(n_clicks, result_data):
+    if not n_clicks:
+        return dash.no_update, dash.no_update
+    if not result_data:
+        return dash.no_update, "Brak wyniku do raportu."
+    try:
+        pdf_bytes = _build_report_pdf(result_data)
+        filename = _report_filename(result_data)
+        return dcc.send_bytes(lambda buffer: buffer.write(pdf_bytes), filename), f"Wygenerowano raport: {filename}"
+    except Exception as exc:
+        return dash.no_update, f"Błąd raportu PDF: {exc}"
+
+
+@app.callback(
+    Output("saved-result-select", "options"),
+    Output("saved-result-select", "value"),
+    Output("saved-result-status", "children"),
+    Input("btn-save-result", "n_clicks"),
+    Input("btn-refresh-results", "n_clicks"),
+    State("store-result", "data"),
+    State("saved-result-select", "value"),
+    prevent_initial_call=True,
+)
+def save_or_refresh_result(save_clicks, refresh_clicks, result_data, current_value):
+    triggered = ctx.triggered_id
+    if triggered == "btn-save-result":
+        if not result_data:
+            return dash.no_update, dash.no_update, "Brak wyniku do zapisu."
+        try:
+            filename = _save_result_file(result_data)
+            options = _saved_result_options()
+            return options, filename, f"Zapisano: {filename}"
+        except Exception as exc:
+            return dash.no_update, dash.no_update, f"Błąd zapisu: {exc}"
+
+    options = _saved_result_options()
+    values = {opt["value"] for opt in options}
+    value = current_value if current_value in values else (options[0]["value"] if options else None)
+    msg = "Lista zapisów odświeżona." if options else "Brak zapisanych wyników."
+    return options, value, msg
+
+
+@app.callback(
+    Output("store-result", "data", allow_duplicate=True),
+    Output("store-selected-trade", "data", allow_duplicate=True),
+    Output("saved-result-status", "children", allow_duplicate=True),
+    Input("btn-load-result", "n_clicks"),
+    State("saved-result-select", "value"),
+    prevent_initial_call=True,
+)
+def load_saved_result(n_clicks, filename):
+    if not n_clicks:
+        return dash.no_update, dash.no_update, dash.no_update
+    if not filename:
+        return dash.no_update, dash.no_update, "Wybierz zapisany plik."
+    try:
+        result = _load_result_file(filename)
+        mode = str(result.get("mode", "wynik")).upper()
+        symbol = str(result.get("symbol", ""))
+        tf = str(result.get("tf", ""))
+        ret = float(result.get("stats", {}).get("net_return_pct", 0.0) or 0.0)
+        ss(
+            running=False,
+            stop=False,
+            result=result,
+            status=f"✓ Wczytano zapisany wynik  |  {mode} {symbol} {tf}  |  {ret:+.2f}%",
+            progress="",
+        )
+        return result, None, f"Wczytano: {filename}"
+    except Exception as exc:
+        return dash.no_update, dash.no_update, f"Błąd wczytywania: {exc}"
+
 # ─── Callback: uruchom / stop ─────────────────────────────────────────────────
 @app.callback(
     Output("btn-run","disabled"),
@@ -1995,6 +3371,10 @@ def export_trades(n_clicks, result_data):
     State("inp-bt-ema-len","value"),
     State("inp-bt-long-zone","value"), State("inp-bt-short-zone","value"),
     State("inp-bt-h4-long","value"), State("inp-bt-h4-short","value"),
+    State("inp-bt-long-close-level","value"),
+    State("inp-bt-h4-long-close","value"),
+    State("inp-bt-long-tp1-pct","value"),
+    State("inp-bt-long-sl-pct","value"),
     State("chk-grid-channel","value"), State("chk-grid-avg","value"),
     State("chk-grid-signal","value"), State("chk-grid-min-level","value"),
     State("chk-grid-reentry","value"), State("chk-grid-ema-filter","value"),
@@ -2002,6 +3382,9 @@ def export_trades(n_clicks, result_data):
     State("chk-grid-ema-len","value"),
     State("chk-grid-long-zone","value"), State("chk-grid-short-zone","value"),
     State("chk-grid-h4-long","value"), State("chk-grid-h4-short","value"),
+    State("chk-grid-long-close-level","value"),
+    State("chk-grid-h4-long-close","value"),
+    State("chk-grid-long-sl-pct","value"),
     prevent_initial_call=True,
 )
 def on_run_stop(nr, ns,
@@ -2009,9 +3392,10 @@ def on_run_stop(nr, ns,
     run_mode, direction, fee, slip, opt, live, score,
     bt_channel, bt_avg, bt_signal, bt_min_level,
     bt_reentry, bt_ema_filter, bt_htf_filter, bt_ema_len, bt_long_zone, bt_short_zone, bt_h4_long, bt_h4_short,
+    bt_long_close_level, bt_h4_long_close, bt_long_tp1_pct, bt_long_sl_pct,
     grid_channel, grid_avg, grid_signal, grid_min_level,
     grid_reentry, grid_ema_filter, grid_htf_filter, grid_ema_len, grid_long_zone, grid_short_zone,
-    grid_h4_long, grid_h4_short):
+    grid_h4_long, grid_h4_short, grid_long_close_level, grid_h4_long_close, grid_long_sl_pct):
 
     _sty_active = {"flex":"1","background":C["red"],"border":"none","borderRadius":"8px",
                    "color":"#fff","padding":"10px","fontSize":"13px","fontWeight":"600",
@@ -2035,9 +3419,10 @@ def on_run_stop(nr, ns,
             fee, slip, opt, live, score,
             bt_channel, bt_avg, bt_signal, bt_min_level,
             bt_reentry, bt_ema_filter, bt_htf_filter, bt_ema_len, bt_long_zone, bt_short_zone, bt_h4_long, bt_h4_short,
+            bt_long_close_level, bt_h4_long_close, bt_long_tp1_pct, bt_long_sl_pct,
             grid_channel, grid_avg, grid_signal, grid_min_level,
             grid_reentry, grid_ema_filter, grid_htf_filter, grid_ema_len, grid_long_zone, grid_short_zone,
-            grid_h4_long, grid_h4_short,
+            grid_h4_long, grid_h4_short, grid_long_close_level, grid_h4_long_close, grid_long_sl_pct,
         ))
         t.start()
         return True, False, _sty_active        # Run zablokuj, Stop aktywuj
@@ -2125,6 +3510,9 @@ def _result_metrics(result_data: dict | None) -> list:
     rr = stats.get("risk_reward_ratio", float("nan"))
     consistency = stats.get("consistency_pct", float("nan"))
     stability = stats.get("stability_score", float("nan"))
+    direction_df = _direction_stats_from_result(result_data)
+    long_stats = _direction_row(direction_df, "long")
+    short_stats = _direction_row(direction_df, "short")
 
     def metric_or_na(value, pattern="{:.2f}"):
         if value is None or (isinstance(value, float) and np.isnan(value)):
@@ -2153,6 +3541,19 @@ def _result_metrics(result_data: dict | None) -> list:
         mcrd("Max DD", f"{dd:.1f}%", None, C["red"]),
         mcrd("CAGR", f"{cagr:.1f}%", f"{symbol} {tf}", pc(cagr)),
         mcrd("Transakcji", str(n_tr), f"exp: ${exp_v:.1f}/tr"),
+        mcrd("Long / Short", f"{int(long_stats['trades'])} / {int(short_stats['trades'])}", "liczba trade'ów"),
+        mcrd(
+            "Long W/L",
+            f"{int(long_stats['wins'])}/{int(long_stats['losses'])}",
+            f"{_money(long_stats['win_pnl_usd'])} / {_money(long_stats['loss_pnl_usd'])}",
+            C["green"] if float(long_stats["net_pnl_usd"]) >= 0 else C["red"],
+        ),
+        mcrd(
+            "Short W/L",
+            f"{int(short_stats['wins'])}/{int(short_stats['losses'])}",
+            f"{_money(short_stats['win_pnl_usd'])} / {_money(short_stats['loss_pnl_usd'])}",
+            C["green"] if float(short_stats["net_pnl_usd"]) >= 0 else C["red"],
+        ),
         mcrd("Return/DD", metric_or_na(rdd), "net return / max DD", metric_color(rdd)),
         mcrd("Sharpe", metric_or_na(sharpe), f"Sortino: {metric_or_na(sortino)}"),
         mcrd("R:R avg", metric_or_na(rr), "avg win / avg loss"),
@@ -2160,8 +3561,29 @@ def _result_metrics(result_data: dict | None) -> list:
     ]
 
 
-def _build_chart_tab(selected_trade: dict | None, chart_filter_val: str | None) -> html.Div:
+def _legend_chip(label: str, color: str, note: str) -> html.Span:
+    return html.Span([
+        html.Span(style={
+            "display": "inline-block",
+            "width": "9px",
+            "height": "9px",
+            "borderRadius": "999px",
+            "background": color,
+            "marginRight": "6px",
+            "boxShadow": f"0 0 0 2px {color}33",
+        }),
+        html.Span(label, style={"fontWeight": "700", "color": C["text"]}),
+        html.Span(f" - {note}", style={"color": C["muted"]}),
+    ], className="chart-legend-chip")
+
+
+def _build_chart_tab(
+    selected_trade: dict | None,
+    chart_filter_val: str | None,
+    chart_view_val: str | None,
+) -> html.Div:
     chart_filt = chart_filter_val or "all"
+    chart_view = _chart_view_mode(chart_view_val)
     filter_opts = [
         {"label": "Wszystkie", "value": "all"},
         {"label": "Long", "value": "long"},
@@ -2171,20 +3593,39 @@ def _build_chart_tab(selected_trade: dict | None, chart_filter_val: str | None) 
     ]
     return html.Div([
         html.Div([
-            html.Span(
-                "Filtr: ",
-                style={"fontSize": "11px", "color": C["muted"], "marginRight": "8px", "lineHeight": "28px"},
-            ),
-            dcc.RadioItems(
-                id="chart-filter-radio",
-                options=filter_opts,
-                value=chart_filt,
-                inline=True,
-                inputStyle={"marginRight": "3px", "accentColor": C["blue"]},
-                labelStyle={"color": C["text"], "fontSize": "12px", "marginRight": "12px", "cursor": "pointer"},
-            ),
+            html.Div([
+                html.Span(
+                    "Filtr: ",
+                    style={"fontSize": "11px", "color": C["muted"], "marginRight": "8px", "lineHeight": "28px"},
+                ),
+                dcc.RadioItems(
+                    id="chart-filter-radio",
+                    options=filter_opts,
+                    value=chart_filt,
+                    inline=True,
+                    inputStyle={"marginRight": "3px", "accentColor": C["blue"]},
+                    labelStyle={"color": C["text"], "fontSize": "12px", "marginRight": "12px", "cursor": "pointer"},
+                ),
+            ], style={"display": "flex", "alignItems": "center", "flexWrap": "wrap"}),
+            html.Div([
+                html.Span(
+                    "Widok: ",
+                    style={"fontSize": "11px", "color": C["muted"], "marginRight": "8px", "lineHeight": "28px"},
+                ),
+                dcc.RadioItems(
+                    id="chart-view-radio",
+                    options=CHART_VIEW_OPTIONS,
+                    value=chart_view,
+                    inline=True,
+                    inputStyle={"marginRight": "3px", "accentColor": C["amber"]},
+                    labelStyle={"color": C["text"], "fontSize": "12px", "marginRight": "12px", "cursor": "pointer"},
+                ),
+            ], style={"display": "flex", "alignItems": "center", "flexWrap": "wrap"}),
         ], style={
             "display": "flex",
+            "justifyContent": "space-between",
+            "gap": "14px",
+            "flexWrap": "wrap",
             "alignItems": "center",
             "marginBottom": "14px",
             "background": C["surf2"],
@@ -2205,9 +3646,17 @@ def _build_chart_tab(selected_trade: dict | None, chart_filter_val: str | None) 
                 ], className="tv-attribution"),
             ], className="panel-head"),
             html.Div(id="tv-chart", className="tv-chart"),
+            html.Div([
+                _legend_chip("pełny punkt", C["green"], "realne wejście long / short na wykresie ceny"),
+                _legend_chip("żółty", C["amber"], "odrzucone przez filtr H4"),
+                _legend_chip("niebieski", C["blue"], "odrzucone przez strefę H1"),
+                _legend_chip("szary", C["muted"], "sygnał pojawił się przy otwartej pozycji"),
+                _legend_chip("pomarańczowy", "#fb923c", "wyłączony kierunek long/short"),
+            ], className="chart-legend"),
             html.Div(
-                "Górny panel pokazuje cenę, linię EMA filtra i markery trade'ów, a dolny przebiegi WT1 i WT2 "
-                "z poziomem zera oraz strefami sygnałowymi.",
+                "Górny panel pokazuje cenę, linię EMA filtra i markery trade'ów. Dolny panel ma tę samą "
+                "wysokość i pokazuje WT1/WT2 dla H1 oraz H4. W trybie Diagnostyka kropki H1 pokazują również "
+                "sygnały odrzucone; najedź na marker L?/S?, aby zobaczyć powód.",
                 className="chart-caption",
             ),
         ], className="result-panel"),
@@ -2222,10 +3671,11 @@ def _build_chart_tab(selected_trade: dict | None, chart_filter_val: str | None) 
     Input("tabs","value"),
     Input("store-result","data"),
     Input("store-chart-filter","data"),
+    Input("store-chart-view","data"),
     Input("store-selected-trade","data"),
     prevent_initial_call=True,
 )
-def render_results(tab, result_data, chart_filter_val, selected_trade_val):
+def render_results(tab, result_data, chart_filter_val, chart_view_val, selected_trade_val):
     r = result_data
     if not r:
         return None, [], _empty_results_view()
@@ -2256,8 +3706,9 @@ def render_results(tab, result_data, chart_filter_val, selected_trade_val):
                 selected_trade=selected_trade_val,
                 filter_mode=chart_filter_val or "all",
                 params=r.get("best_params") or r.get("params_used") or DEFAULT_PARAMS,
+                view_mode=chart_view_val or "standard",
             )
-            return chart_payload, metrics, _build_chart_tab(selected_trade_val, chart_filter_val)
+            return chart_payload, metrics, _build_chart_tab(selected_trade_val, chart_filter_val, chart_view_val)
 
         if tab == "trades":
             trades_df = pd.DataFrame(r.get("trades", []))
@@ -2276,22 +3727,41 @@ def render_results(tab, result_data, chart_filter_val, selected_trade_val):
                             style={"fontSize": "11px", "color": C["muted"], "marginTop": "4px"},
                         ),
                     ]),
-                    html.Button(
-                        "Eksport CSV",
-                        id="btn-export-trades",
-                        n_clicks=0,
-                        style={
-                            "background": C["surf2"],
-                            "color": C["text"],
-                            "border": f"1px solid {C['border']}",
-                            "borderRadius": "12px",
-                            "padding": "10px 14px",
-                            "fontSize": "12px",
-                            "fontWeight": "600",
-                            "cursor": "pointer",
-                            "whiteSpace": "nowrap",
-                        },
-                    ),
+                    html.Div([
+                        html.Button(
+                            "Eksport CSV",
+                            id="btn-export-trades",
+                            n_clicks=0,
+                            style={
+                                "background": C["surf2"],
+                                "color": C["text"],
+                                "border": f"1px solid {C['border']}",
+                                "borderRadius": "12px",
+                                "padding": "10px 14px",
+                                "fontSize": "12px",
+                                "fontWeight": "600",
+                                "cursor": "pointer",
+                                "whiteSpace": "nowrap",
+                            },
+                        ),
+                        html.Button(
+                            "Eksport Pine",
+                            id="btn-export-pine-trades",
+                            n_clicks=0,
+                            title="Eksport Pine Script z markerami transakcji",
+                            style={
+                                "background": C["blue"],
+                                "color": "#07111b",
+                                "border": "none",
+                                "borderRadius": "12px",
+                                "padding": "10px 14px",
+                                "fontSize": "12px",
+                                "fontWeight": "800",
+                                "cursor": "pointer",
+                                "whiteSpace": "nowrap",
+                            },
+                        ),
+                    ], style={"display": "flex", "gap": "8px", "alignItems": "center"}),
                 ], style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "gap": "16px", "marginBottom": "10px"}),
                 dash_table.DataTable(
                     id="trades-table",
@@ -2440,6 +3910,7 @@ def render_results(tab, result_data, chart_filter_val, selected_trade_val):
 
         if tab == "brkdwn":
             side_df = pd.DataFrame(r.get("side_bk", []))
+            direction_df = _direction_stats_from_result(r)
             cross_df = pd.DataFrame(r.get("cross_bk", []))
             yr_df = pd.DataFrame(r.get("yr_bk", []))
             q_df = pd.DataFrame(r.get("q_bk", []))
@@ -2495,6 +3966,7 @@ def render_results(tab, result_data, chart_filter_val, selected_trade_val):
             return dash.no_update, metrics, html.Div([
                 html.Div(ext, style={"display": "flex", "gap": "10px", "flexWrap": "wrap", "marginBottom": "14px"}),
                 mini(side_df, "Long vs Short"),
+                mini(direction_df, "Long / Short - wygrane i przegrane"),
                 mini(cross_df, "Bullish vs Bearish H1 cross"),
                 mini(yr_df, "Breakdown roczny"),
                 mini(q_df, "Breakdown kwartalny"),
@@ -2581,6 +4053,7 @@ def render_results(tab, result_data, chart_filter_val, selected_trade_val):
                 selected_trade=sel_trade,
                 filter_mode=chart_filt,
                 params=r.get("best_params") or r.get("params_used") or DEFAULT_PARAMS,
+                view_mode=chart_view_val or "standard",
             )
             _filter_opts = [
                 {"label":"Wszystkie","value":"all"},
@@ -2619,8 +4092,8 @@ def render_results(tab, result_data, chart_filter_val, selected_trade_val):
                     ], className="panel-head"),
                     html.Div(id="tv-chart", className="tv-chart"),
                     html.Div(
-                        "Cena, linia EMA filtra, markery transakcji oraz panel WaveTrend sa renderowane przez "
-                        "ten sam otwarty silnik Lightweight Charts od TradingView.",
+                        "Górny panel pokazuje cenę, linię EMA filtra i markery trade'ów. Dolny panel ma tę samą "
+                        "wysokość i pokazuje WT1/WT2 dla H1 oraz H4 z zielonymi i czerwonymi kropkami przecięć.",
                         className="chart-caption",
                     ),
                 ], className="result-panel"),
@@ -2796,7 +4269,7 @@ if __name__ == "__main__":
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--debug", action="store_true")
     a = p.parse_args()
-    print(f"\n{'='*50}\n  Bee7 WaveTrend Dashboard  →  http://{a.host}:{a.port}\n{'='*50}\n")
+    print(f"\n{'='*50}\n  Bee7 WaveTrend Dashboard  ->  http://{a.host}:{a.port}\n{'='*50}\n")
     app.run(host=a.host, port=a.port, debug=a.debug)
 
 

@@ -1,4 +1,4 @@
-﻿# bee7
+# bee7
 
 `bee7` to pierwsza wersja strategii WaveTrend zbudowana na tej samej strukturze projektu co `bee1`.
 Dashboard, wykres, flow backtest/WFO/live oraz uklad plikow pozostaja spojne z wczesniejszym projektem, ale logika wejsc i wyjsc zostala przestawiona na sygnaly WaveTrend.
@@ -66,7 +66,7 @@ Dashboard ma teraz dwa osobne tryby:
 ## Uruchomienie
 
 ```bash
-python bee7_dashboard.py --host 0.0.0.0 --port 8067
+python bee7_dashboard.py --host 0.0.0.0 --port 8064
 ```
 
 ```bash
